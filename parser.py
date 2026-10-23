@@ -4,8 +4,8 @@ import hashlib
 import json
 import os
 import queue
-import socket
 import subprocess
+import socket
 import time
 import urllib.parse as up
 from concurrent.futures import ThreadPoolExecutor
@@ -25,20 +25,25 @@ TMP_DIR = os.path.join(ROOT, "tmp")
 PING_URL = "https://www.gstatic.com/generate_204"
 PING_TIMEOUT = 7
 PING_ATTEMPTS = 2
+GEO_TIMEOUT = 10
 CHECK_THREADS = int(os.environ.get("CHECK_THREADS", 20))
 BASE_PORT = 20000
 
 MAX_CHECKS = int(os.environ.get("MAX_CHECKS", 400))
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 1500))  # секунд на проверку
 
-GEO_BATCH_SIZE = 100
-GEO_BATCH_PAUSE = 4.0
-GEO_FALLBACK_LIMIT = 150
-GEO_FALLBACK_PAUSE = 1.2
-GEO_EXTRA_TIME = 300
+GEO_VERSION = 2  # при смене логики определения страны старые cc сбрасываются
 
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
 UA = "v2rayNG/1.8.5"
+
+# Геосервисы вызываются ЧЕРЕЗ туннель: страна = страна выходного IP сервера
+GEO_ENDPOINTS = [
+    ("https://ipwho.is/",
+     lambda d: (d.get("country_code"), d.get("country")) if d.get("success") else None),
+    ("https://ipapi.co/json/",
+     lambda d: (d.get("country_code"), d.get("country_name")) if d.get("country_code") else None),
+]
 
 
 # ---------- утилиты ----------
@@ -75,7 +80,7 @@ def save_json_atomic(path, data):
 
 
 def load_state():
-    default = {"servers": {}, "geo": {}}
+    default = {"servers": {}, "geo_version": 0}
     if not os.path.exists(STATE_FILE):
         return default
     try:
@@ -95,15 +100,16 @@ def load_state():
         return default
 
     data.setdefault("servers", {})
-    data.setdefault("geo", {})
+    data.setdefault("geo_version", 0)
     # миграция со старого формата (ключ "working")
     for k, v in data.pop("working", {}).items():
         data["servers"].setdefault(k, {
             "link": v.get("link", ""), "host": v.get("host", ""), "port": v.get("port", 0),
             "sub_id": v.get("sub_id", "x"), "sub_pos": v.get("sub_pos", 0),
             "status": "working", "ping": v.get("ping"), "last_checked": 0,
-            "ip": None, "cc": v.get("cc"), "country": v.get("country"),
+            "cc": None, "country": None,
         })
+    data.pop("geo", None)
     return data
 
 
@@ -116,7 +122,6 @@ def flag(cc):
 # ---------- разбор ссылок ----------
 
 def build_stream(q):
-    """q - нормализованные параметры ссылки/конфига. Возвращает streamSettings для xray."""
     net = (q.get("type") or "tcp").lower()
     if net in ("raw", ""):
         net = "tcp"
@@ -331,8 +336,27 @@ def wait_port(port, proc, timeout=5):
     return False
 
 
+def exit_geo(session):
+    """Страна выходного IP туннеля. None, если ни один геосервис не ответил."""
+    for url, parse in GEO_ENDPOINTS:
+        try:
+            r = session.get(url, timeout=GEO_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            res = parse(r.json())
+            if res and res[0] and len(res[0]) == 2:
+                return res[0].upper(), res[1] or res[0].upper()
+        except Exception:
+            continue
+    return None
+
+
 def ping_keepalive(ob, port):
-    """via Proxy GET + KeepAlive: один xray, одна сессия, два запроса, лучший результат (мс)."""
+    """
+    via Proxy GET + KeepAlive: один xray, одна сессия.
+    Два GET-запроса (берём лучший результат), затем страна по выходному IP туннеля.
+    Возвращает {"ping", "cc", "country"} или None (сервер мёртв).
+    """
     os.makedirs(TMP_DIR, exist_ok=True)
     cfg = {
         "log": {"loglevel": "none"},
@@ -362,7 +386,12 @@ def ping_keepalive(ob, port):
                 if r.status_code != 204:
                     break
                 timings.append((time.perf_counter() - t0) * 1000)
-        return min(timings) if timings else None
+            if not timings:
+                return None
+            geo = exit_geo(s)
+            if not geo:
+                return None
+        return {"ping": min(timings), "cc": geo[0], "country": geo[1]}
     finally:
         proc.kill()
         proc.wait()
@@ -382,55 +411,18 @@ def check_many(items, deadline):
             return it["key"], "skip"
         port = ports.get()
         try:
-            ping = ping_keepalive(it["ob"], port)
+            res = ping_keepalive(it["ob"], port)
         except Exception:
-            ping = None
+            res = None
         finally:
             ports.put(port)
-        return it["key"], ping
+        return it["key"], res
 
     results = {}
     with ThreadPoolExecutor(CHECK_THREADS) as ex:
         for k, v in ex.map(job, items):
             results[k] = v
     return results
-
-
-# ---------- страна ----------
-
-def resolve(host):
-    try:
-        return socket.gethostbyname(host)
-    except OSError:
-        return None
-
-
-def geo_batch(ips):
-    """ip-api batch: до 100 IP за запрос. Возвращает {ip: [cc, country]}."""
-    out = {}
-    for i in range(0, len(ips), GEO_BATCH_SIZE):
-        chunk = ips[i:i + GEO_BATCH_SIZE]
-        try:
-            r = requests.post("http://ip-api.com/batch?fields=status,countryCode,country,query",
-                              json=[{"query": ip} for ip in chunk], timeout=20)
-            for d in r.json():
-                if d.get("status") == "success":
-                    out[d["query"]] = [d["countryCode"], d["country"]]
-        except Exception as e:
-            print(f"[!] ip-api batch: {e}")
-        if i + GEO_BATCH_SIZE < len(ips):
-            time.sleep(GEO_BATCH_PAUSE)
-    return out
-
-
-def geo_single(ip):
-    try:
-        d = requests.get(f"https://ipwho.is/{ip}", timeout=10).json()
-        if d.get("success"):
-            return [d["country_code"], d["country"]]
-    except Exception:
-        pass
-    return None
 
 
 # ---------- основной цикл ----------
@@ -442,7 +434,14 @@ def main():
 
     state = load_state()
     servers = state["servers"]
-    geo = state["geo"]
+
+    # одноразовый сброс стран, определённых по IP хоста (неверно для CDN/anycast)
+    if state.get("geo_version") != GEO_VERSION:
+        for s in servers.values():
+            s["cc"] = None
+            s["country"] = None
+        state["geo_version"] = GEO_VERSION
+        print("[*] миграция: страны сброшены, будут определены через туннель")
 
     dead_lines = {}
     for line in read_lines(DEAD_FILE):
@@ -467,18 +466,22 @@ def main():
 
     for k, (e, sub_id, pos) in fresh.items():
         if k in servers:
-            servers[k]["link"] = e["link"]  # обновили ссылку, статус и пинг сохраняем
+            servers[k]["link"] = e["link"]
         else:
             servers[k] = {
                 "link": e["link"], "host": e["host"], "port": e["port"],
                 "sub_id": sub_id, "sub_pos": pos, "status": "untested",
-                "ping": None, "last_checked": 0, "ip": None, "cc": None, "country": None,
+                "ping": None, "last_checked": 0, "cc": None, "country": None,
             }
 
-    # 2. очередь проверок: сначала непроверенные, потом самые давние рабочие
+    # 2. очередь: непроверенные, рабочие без страны, затем самые давние рабочие
     cands = [k for k in servers if k not in dead]
-    cands.sort(key=lambda k: (servers[k]["status"] == "working",
-                              servers[k]["last_checked"], servers[k]["sub_pos"]))
+    cands.sort(key=lambda k: (
+        servers[k]["status"] == "working",
+        servers[k].get("cc") is not None,
+        servers[k]["last_checked"],
+        servers[k]["sub_pos"],
+    ))
 
     batch = []
     for k in cands[:MAX_CHECKS]:
@@ -500,49 +503,22 @@ def main():
         k = e["key"]
         r = results.get(k, "skip")
         s = servers.get(k)
-        if s is None or r == "skip":
+        if s is None or (isinstance(r, str) and r == "skip"):
             skipped += 1
             continue
         if r is None:
+            # нет пинга или нет страны через туннель -> мёртв
             bad += 1
             dead.add(k)
             dead_lines[k] = f"{k} {s['host']}:{s['port']}"
             servers.pop(k, None)
         else:
             ok += 1
-            s.update(status="working", ping=round(r), last_checked=now)
-    print(f"[=] проверка: рабочих {ok}, нерабочих {bad}, не успели {skipped}")
+            s.update(status="working", ping=round(r["ping"]), last_checked=now,
+                     cc=r["cc"], country=r["country"])
+    print(f"[=] проверка: рабочих {ok}, мёртвых {bad}, не успели {skipped}")
 
-    # 3. страна для рабочих без страны
-    working_keys = [k for k, s in servers.items() if s["status"] == "working"]
-    pend = [k for k in working_keys if not servers[k].get("cc")]
-    hosts = sorted({servers[k]["host"] for k in pend})
-    with ThreadPoolExecutor(20) as ex:
-        host_ip = dict(zip(hosts, ex.map(resolve, hosts)))
-    for k in pend:
-        servers[k]["ip"] = host_ip.get(servers[k]["host"])
-
-    need = sorted({servers[k]["ip"] for k in pend
-                   if servers[k].get("ip") and servers[k]["ip"] not in geo})
-    print(f"[geo] IP для запроса: {len(need)}")
-    geo.update(geo_batch(need))
-
-    missing = [ip for ip in need if ip not in geo][:GEO_FALLBACK_LIMIT]
-    for ip in missing:
-        if time.time() > deadline + GEO_EXTRA_TIME:
-            break
-        r = geo_single(ip)
-        if r:
-            geo[ip] = r
-        time.sleep(GEO_FALLBACK_PAUSE)
-
-    for k in pend:
-        s = servers[k]
-        ip = s.get("ip")
-        if ip and ip in geo:
-            s["cc"], s["country"] = geo[ip]
-
-    # 4. сохранение
+    # 3. сохранение
     ordered = sorted([k for k, s in servers.items() if s["status"] == "working"],
                      key=lambda k: (servers[k]["sub_id"], servers[k]["sub_pos"]))
     write_lines(WORKING_TXT, [servers[k]["link"] for k in ordered])
@@ -561,10 +537,10 @@ def main():
     write_lines(WORKER_TXT, worker_lines)
 
     write_lines(DEAD_FILE, sorted(dead_lines.values()))
-    save_json_atomic(STATE_FILE, {"servers": servers, "geo": geo})
+    save_json_atomic(STATE_FILE, state)
 
     print(f"[=] рабочих: {len(ordered)}, для воркера: {len(worker_lines)}, "
-          f"нерабочих всего: {len(dead_lines)}, время: {int(time.time() - start)} сек")
+          f"мёртвых всего: {len(dead_lines)}, время: {int(time.time() - start)} сек")
 
 
 if __name__ == "__main__":
