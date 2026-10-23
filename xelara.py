@@ -3,21 +3,16 @@
 """
 Combined Source Loader + Xray Parser & Checker
 ============================================
-Один скрипт, который:
- 1) Читает источники из sources.txt и my_configs.txt
- 2) Скачивает источники асинхронно (aiohttp + THREADS)
-    - обычный GET, при неудаче — резервный Happ-метод
-    - извлекает vless://, trojan://, hy2:// из текста, base64, JSON, YAML
-    - неудачные источники уходят в blacklist_sources.txt и удаляются из sources.txt
-    - всё найденное пишется в configs.txt
- 3) Прогоняет все конфиги через Xray-core (Working/UnWorking/AllWorking)
- 4) Формирует working.txt, output/AllWorking/latest.json (по странам),
-    перепроверяет ранее собранные файлы (--recheck-files)
+v-dbl: добавлена двойная проверка.
+        Первый проход по всем серверам.
+        Упавшие уходят в конец очереди и проверяются второй раз.
+        Если не ответили и второй раз — выбрасываются из кэша
+        и не попадают в UnWorking/all.txt.
+        Список выброшенных пишется в discarded.txt (URI + причина).
+        Отключить: --no-double-check.
+        Сохранить в UnWorking после второго фейла: --keep-failed.
 """
 
-# ============================================================================
-# Bootstrap зависимостей
-# ============================================================================
 import importlib, subprocess, sys
 
 REQUIRED = {
@@ -48,9 +43,6 @@ def _bootstrap():
 
 _bootstrap()
 
-# ============================================================================
-# Импорты
-# ============================================================================
 import argparse
 import asyncio
 import base64
@@ -96,6 +88,7 @@ SOURCES_FILE     = "sources.txt"
 CONFIGS_FILE     = "configs.txt"
 MY_CONFIGS_FILE  = "my_configs.txt"
 BLACKLIST_FILE   = "blacklist_sources.txt"
+DISCARD_FILE     = "discarded.txt"
 
 THREADS         = 50
 TIMEOUT_NORMAL  = 5
@@ -747,7 +740,7 @@ async def load_http_sources():
     return stats['all_configs'], my_configs, stats
 
 # ============================================================================
-# Proxy dataclass + URI-парсер (xray_parser)
+# Proxy dataclass + URI-парсер
 # ============================================================================
 @dataclass
 class Proxy:
@@ -1265,7 +1258,8 @@ def _stream_settings(p):
         xh = {"path": p.get("path", "/") or "/",
               "mode": p.get("mode", "") or "auto"}
         if p.get("host"): xh["host"] = p["host"]
-        if extra:         xh["extra"] = extra
+        if extra:
+            xh["extra"] = extra
         ss["xhttpSettings"] = xh
     elif net == "tcp" and p.get("headerType") == "http":
         ss["tcpSettings"] = {"header": {"type": "http",
@@ -1713,11 +1707,33 @@ def _named_lines(cache, proxies):
     return lines
 
 # ============================================================================
-# Параллельная проверка
+# Параллельная проверка — v-dbl: двойная проверка
 # ============================================================================
 def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
-                    concurrency, server_timeout=SERVER_TIMEOUT_DEFAULT):
+                    concurrency, server_timeout=SERVER_TIMEOUT_DEFAULT,
+                    double_check=True, discard_failed=True,
+                    discard_log=DISCARD_FILE):
+    """
+    v-dbl: двойная проверка.
+      - Первый проход по всем серверам.
+      - Упавшие (r["ok"] == False) уходят в конец очереди.
+      - Второй проход только по упавшим.
+      - Упавшие и второй раз выбрасываются из кэша
+        (и не попадают ни в Working, ни в UnWorking).
+        Строка о выбросе пишется в discard_log (URI + причина).
+      - double_check=False: одноразовая проверка (старое поведение).
+      - discard_failed=False: неудачники после второго раза остаются
+        в кэше как unworking (попадут в UnWorking/all.txt).
+    """
     results = {}
+
+    # очищаем лог при старте, если он есть (не дописываем через прогоны)
+    if double_check and discard_failed and discard_log:
+        try:
+            Path(discard_log).write_text("", encoding="utf-8")
+        except Exception:
+            pass
+
     for iface_key, iface_name in ifaces.items():
         send_through = None
         if iface_name:
@@ -1725,39 +1741,90 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
             if not send_through:
                 print(f"[!] интерфейс '{iface_name}' не найден — пропускаю")
                 continue
-        pairs = []; lock = threading.Lock()
-        done = [0]; total = len(proxies)
-        print_lock = threading.Lock()
 
-        def _w(pr):
-            prior = ""
-            it = cache.items.get(pr.dedup_key(), {})
-            if it and it.get("country_code"):
-                prior = it["country_code"]
-            r = check_proxy(pr, xray, timeout, send_through,
-                            prior_cc=prior, server_timeout=server_timeout)
-            cache.upsert(pr, r, sub_index)
-            with lock:
-                pairs.append((pr, r)); done[0] += 1; n = done[0]
-            label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
-            with print_lock:
-                if r["ok"]:
-                    flag = flag_from_cc(r.get("country_code", ""))
-                    cn = country_ru(r.get("country_code", ""))
-                    ka = r.get("latency_keepalive")
-                    ka_s = f"ka={ka}ms" if ka is not None else "ka=—"
-                    el = r.get("elapsed")
-                    el_s = f" {el}s" if el is not None else ""
-                    print(f"  [{n}/{total}] OK {flag} {cn} {r['latency']}ms {ka_s}{el_s} "
-                          f"ip={r['ip']} | {label}")
+        def _run_batch(batch, pass_label):
+            """Один проход по batch в потоках. Возвращает [(pr, r), ...]."""
+            if not batch:
+                return []
+            pairs = []
+            lock = threading.Lock()
+            done = [0]
+            total = len(batch)
+            print_lock = threading.Lock()
+
+            def _w(pr):
+                prior = ""
+                it = cache.items.get(pr.dedup_key(), {})
+                if it and it.get("country_code"):
+                    prior = it["country_code"]
+                r = check_proxy(pr, xray, timeout, send_through,
+                                prior_cc=prior, server_timeout=server_timeout)
+                cache.upsert(pr, r, sub_index)
+                with lock:
+                    pairs.append((pr, r))
+                    done[0] += 1
+                    n = done[0]
+                label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
+                with print_lock:
+                    if r["ok"]:
+                        flag = flag_from_cc(r.get("country_code", ""))
+                        cn = country_ru(r.get("country_code", ""))
+                        ka = r.get("latency_keepalive")
+                        ka_s = f"ka={ka}ms" if ka is not None else "ka=—"
+                        el = r.get("elapsed")
+                        el_s = f" {el}s" if el is not None else ""
+                        print(f"  {pass_label} [{n}/{total}] OK {flag} {cn} {r['latency']}ms "
+                              f"{ka_s}{el_s} ip={r['ip']} | {label}")
+                    else:
+                        el = r.get("elapsed")
+                        el_s = f" {el}s" if el is not None else ""
+                        print(f"  {pass_label} [{n}/{total}] FAIL{el_s} {r['error']} | {label}")
+
+            with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
+                list(ex.map(_w, batch))
+            return pairs
+
+        # ---------- Первый проход: все прокси ----------
+        first_pairs = _run_batch(proxies, "1st")
+        final_pairs = [(pr, r) for pr, r in first_pairs if r["ok"]]
+        failed = [pr for pr, r in first_pairs if not r["ok"]]
+
+        # ---------- Второй проход: только упавшие ----------
+        if double_check and failed:
+            print(f"\n  ⟳ Двойная проверка: {len(failed)} серверов без ответа, "
+                  f"ставлю в конец очереди...")
+            retry_pairs = _run_batch(failed, "2nd")
+            success_retry = [(pr, r) for pr, r in retry_pairs if r["ok"]]
+            still_failed = [(pr, r) for pr, r in retry_pairs if not r["ok"]]
+
+            final_pairs.extend(success_retry)
+
+            if still_failed:
+                print(f"\n  ✗ После второй проверки не ответили: {len(still_failed)}")
+                if discard_failed:
+                    for pr, r in still_failed:
+                        key = pr.dedup_key()
+                        cache.items.pop(key, None)
+                        label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
+                        err = r.get("error") or "timeout"
+                        print(f"    ✗ выброшен: {label} ({err})")
+                        if discard_log:
+                            try:
+                                with open(discard_log, "a", encoding="utf-8") as f:
+                                    f.write(f"{pr.raw or label}\t{err}\n")
+                            except Exception:
+                                pass
                 else:
-                    el = r.get("elapsed")
-                    el_s = f" {el}s" if el is not None else ""
-                    print(f"  [{n}/{total}] FAIL{el_s} {r['error']} | {label}")
+                    # не выбрасываем — оставляем как unworking (попадут в UnWorking/all.txt)
+                    final_pairs.extend(still_failed)
+            else:
+                print(f"\n  ✓ После второй проверки восстановились: {len(success_retry)}")
+        elif failed and not double_check:
+            # double_check выключен — все упавшие остаются в результате как unworking
+            final_pairs.extend([(pr, r) for pr, r in first_pairs if not r["ok"]])
 
-        with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
-            list(ex.map(_w, proxies))
-        results[iface_key] = pairs
+        results[iface_key] = final_pairs
+
     return results
 
 # ============================================================================
@@ -1815,7 +1882,7 @@ def _collect_proxies_from_uris(uris):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Combined Source Loader + Xray Checker")
+        description="Combined Source Loader + Xray Checker (with double-check)")
     # Loader
     ap.add_argument("--no-load", action="store_true",
                     help="не скачивать sources.txt (только проверять уже собранное)")
@@ -1837,6 +1904,16 @@ def main():
                     help="файлы для перепроверки (через запятую)")
     ap.add_argument("--no-recheck-final", action="store_true",
                     help="не перепроверять файлы из --recheck-files")
+
+    # v-dbl: двойная проверка
+    ap.add_argument("--no-double-check", action="store_true",
+                    help="не перепроверять серверы, которые не ответили с первого раза")
+    ap.add_argument("--keep-failed", action="store_true",
+                    help="оставлять в кэше серверы, которые не ответили и после второй проверки "
+                         "(попадут в UnWorking/all.txt). По умолчанию они выбрасываются.")
+    ap.add_argument("--discard-log", default=DISCARD_FILE,
+                    help=f"лог выброшенных серверов (default: {DISCARD_FILE})")
+
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
     mode.add_argument("--only-old", action="store_true")
@@ -1844,6 +1921,14 @@ def main():
 
     if args.concurrency < 1:  args.concurrency = 1
     if args.concurrency > 64: args.concurrency = 64
+
+    # Единый набор параметров для всех вызовов _check_parallel
+    check_kwargs = dict(
+        server_timeout=args.server_timeout,
+        double_check=not args.no_double_check,
+        discard_failed=not args.keep_failed,
+        discard_log=args.discard_log,
+    )
 
     cache = Cache(Path(args.cache))
     writer = OutputWriter(Path(args.output_dir))
@@ -1855,7 +1940,6 @@ def main():
     if not args.only_old and not args.no_load:
         loaded, my_cfgs, _stats = asyncio.run(load_http_sources())
         extra_uris_from_loader = list(loaded) + list(my_cfgs)
-        # Источники (URL) — из sources.txt (уже обновлённого)
         src_path = Path(SOURCES_FILE)
         sources = []
         if src_path.exists():
@@ -1873,6 +1957,8 @@ def main():
     print(f"\n[i] режим: {'only-new' if args.only_new else 'only-old' if args.only_old else 'all'}")
     print(f"[i] источников (URL): {len(sources)}")
     print(f"[i] параллельно: {args.concurrency} | бюджет на сервер: {args.server_timeout}s")
+    print(f"[i] двойная проверка: {'ВКЛ' if check_kwargs['double_check'] else 'ВЫКЛ'} "
+          f"| выбрасывать после 2 фейлов: {'ДА' if check_kwargs['discard_failed'] else 'НЕТ'}")
     print(f"[i] в кэше: {len(cache.items)} записей "
           f"(working={sum(1 for v in cache.items.values() if v.get('status')=='working')}, "
           f"unworking={sum(1 for v in cache.items.values() if v.get('status')=='unworking')})")
@@ -1890,7 +1976,6 @@ def main():
     # ---------------------------------------------------------------
     # Фаза 2: Сбор Proxy-объектов для проверки
     # ---------------------------------------------------------------
-    # 2a. Из configs.txt / --input
     input_path = Path(args.input)
     file_uris = []
     if input_path.exists():
@@ -1899,10 +1984,8 @@ def main():
             if line and not line.startswith("#"):
                 file_uris.append(line)
 
-    # 2b. Из только что загруженных
     all_uris = file_uris + extra_uris_from_loader
 
-    # 2c. Если есть только источники (URL), но нет конфигов и loader не запускался
     if not all_uris and sources and (args.only_old or args.no_load):
         for s in sources:
             p = parse_uri(s)
@@ -1912,7 +1995,7 @@ def main():
     proxies = _collect_proxies_from_uris(all_uris)
     print(f"[i] распарсено URI: {len(all_uris)} → валидных Proxy: {len(proxies)}")
 
-    # 2d. Recheck файлов
+    # Recheck файлов
     prev_final_proxies = []
     if not args.no_recheck_final and not args.only_new:
         paths = [s.strip() for s in args.recheck_files.split(",") if s.strip()]
@@ -1936,7 +2019,7 @@ def main():
         if uniq:
             _check_parallel(uniq, xray, args.timeout, ifaces, cache,
                             sub_index=0, concurrency=args.concurrency,
-                            server_timeout=args.server_timeout)
+                            **check_kwargs)
         cache.save()
         _write_final(cache, writer, 0, args.final_file)
         return
@@ -1949,7 +2032,7 @@ def main():
         if new_only:
             _check_parallel(new_only, xray, args.timeout, ifaces, cache,
                             sub_index=1, concurrency=args.concurrency,
-                            server_timeout=args.server_timeout)
+                            **check_kwargs)
         cache.save()
         _write_final(cache, writer, len(sources) or 1, args.final_file)
         return
@@ -1962,7 +2045,7 @@ def main():
         print(f"{'='*70}")
         _check_parallel(uniq, xray, args.timeout, ifaces, cache,
                         sub_index=1, concurrency=args.concurrency,
-                        server_timeout=args.server_timeout)
+                        **check_kwargs)
 
     if prev_final_proxies:
         print(f"\n{'='*70}")
@@ -1971,7 +2054,7 @@ def main():
         uniq_re = _dedup(prev_final_proxies)
         results = _check_parallel(uniq_re, xray, args.timeout, ifaces, cache,
                                   sub_index=999, concurrency=args.concurrency,
-                                  server_timeout=args.server_timeout)
+                                  **check_kwargs)
         sub_w, sub_u = [], []
         for _, pairs in results.items():
             for pr, r in pairs:
