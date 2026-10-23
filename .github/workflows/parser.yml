@@ -11,6 +11,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: parser
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -23,20 +27,36 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
-        run: pip install requests[socks]
+        run: pip install "requests[socks]"
 
       - name: Install xray
         run: |
           wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           unzip -o Xray-linux-64.zip xray geoip.dat geosite.dat -d .
           chmod +x xray
+          ./xray version
 
       - name: Run parser
         run: python parser.py
+        env:
+          MAX_CHECKS: "400"
+          TIME_BUDGET: "1500"
+          CHECK_THREADS: "20"
 
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || (git commit -m "parser: update $(date -u +%F_%H-%M)" && git push)
+          if git diff --cached --quiet; then
+            echo "Изменений нет"
+            exit 0
+          fi
+          git commit -m "parser: update $(date -u +%F_%H-%M)"
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin main && git push origin HEAD:main && exit 0
+            echo "push не прошёл, повтор через 5 сек ($i/3)"
+            sleep 5
+          done
+          echo "Не удалось отправить изменения"
+          exit 1
