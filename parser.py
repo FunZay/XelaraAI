@@ -22,11 +22,12 @@ STATE_FILE = os.path.join(DATA, "state.json")
 XRAY_BIN = os.path.join(ROOT, "xray")
 TMP_DIR = os.path.join(ROOT, "tmp")
 
-CHECK_URL = "http://www.gstatic.com/generate_204"
-CHECK_TIMEOUT = 10
+PING_URL = "https://www.gstatic.com/generate_204"  # https, чтобы было TLS как в приложении
+PING_TIMEOUT = 7        # приложение позволяет 5–15 сек
+PING_ATTEMPTS = 2        # как в приложении: два запроса, берём лучший
 CHECK_THREADS = 10
 BASE_PORT = 20000
-GEO_DELAY = 1.5  # пауза между запросами к гео-сервисам (лимиты)
+GEO_DELAY = 1.5
 PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
 
 
@@ -188,7 +189,24 @@ def fetch_sub(url):
 
 # ---------- проверка через xray ----------
 
-def check_server(ob, port):
+def wait_port(port, timeout=5):
+    """Ждём, пока xray начнёт слушать SOCKS-порт, вместо фиксированного sleep."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def ping_keepalive(ob, port):
+    """
+    Режим via Proxy GET + KeepAlive:
+    одна сессия xray, один requests.Session (одно переиспользуемое соединение),
+    два GET-запроса, результат - лучший из двух. Возвращает мс или None.
+    """
     os.makedirs(TMP_DIR, exist_ok=True)
     cfg = {
         "log": {"loglevel": "none"},
@@ -203,16 +221,32 @@ def check_server(ob, port):
     proc = subprocess.Popen([XRAY_BIN, "run", "-c", path],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        time.sleep(2)  # даём xray подняться
+        if not wait_port(port):
+            return None
+
         proxy = f"socks5h://127.0.0.1:{port}"
-        r = requests.get(CHECK_URL, proxies={"http": proxy, "https": proxy},
-                         timeout=CHECK_TIMEOUT)
-        return r.status_code == 204
-    except Exception:
-        return False
+        timings = []
+        # одна сессия на все запросы = переиспользование TCP/TLS-соединения
+        with requests.Session() as s:
+            s.proxies = {"http": proxy, "https": proxy}
+            for _ in range(PING_ATTEMPTS):
+                t0 = time.perf_counter()
+                try:
+                    r = s.get(PING_URL, timeout=PING_TIMEOUT)
+                except requests.RequestException:
+                    break
+                elapsed = (time.perf_counter() - t0) * 1000
+                if r.status_code != 204:
+                    break
+                timings.append(elapsed)
+        return min(timings) if timings else None
     finally:
         proc.kill()
         proc.wait()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def check_many(servers):
@@ -223,13 +257,13 @@ def check_many(servers):
     def job(s):
         port = ports.get()
         try:
-            ok = check_server(s["ob"], port)
+            ping = ping_keepalive(s["ob"], port)
         finally:
             ports.put(port)
-        return s["key"], ok
+        return s["key"], ping
 
     with ThreadPoolExecutor(CHECK_THREADS) as ex:
-        return dict(ex.map(job, servers))
+        return dict(ex.map(job, servers))  # key -> ping (мс) или None
 
 
 # ---------- определение страны ----------
@@ -316,11 +350,13 @@ def main():
 
     for p in to_check:
         k = p["key"]
-        if results.get(k):
+        ping = results.get(k)
+        if ping is not None:
             prev = working.get(k, {})
             working[k] = {
                 "link": p["link"], "host": p["host"], "port": p["port"],
                 "sub_id": p["sub_id"], "sub_pos": p["sub_pos"],
+                "ping": round(ping),
                 "cc": prev.get("cc"), "country": prev.get("country"),
             }
         else:
