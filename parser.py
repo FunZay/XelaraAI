@@ -22,9 +22,9 @@ STATE_FILE = os.path.join(DATA, "state.json")
 XRAY_BIN = os.path.join(ROOT, "xray")
 TMP_DIR = os.path.join(ROOT, "tmp")
 
-PING_URL = "https://www.gstatic.com/generate_204"  # https, чтобы было TLS как в приложении
-PING_TIMEOUT = 7        # приложение позволяет 5–15 сек
-PING_ATTEMPTS = 2        # как в приложении: два запроса, берём лучший
+PING_URL = "https://www.gstatic.com/generate_204"
+PING_TIMEOUT = 7          # приложение позволяет 5–15 сек
+PING_ATTEMPTS = 2         # как в приложении: два запроса, берём лучший
 CHECK_THREADS = 10
 BASE_PORT = 20000
 GEO_DELAY = 1.5
@@ -50,8 +50,42 @@ def read_lines(path):
 
 
 def write_lines(path, lines):
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + ("\n" if lines else ""))
+    os.replace(tmp, path)
+
+
+def save_json_atomic(path, data):
+    """Запись во временный файл и замена. Обрыв процесса не оставит пустой файл."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_state():
+    """Читает state.json. Пустой или битый файл не валит скрипт, а сбрасывается с бэкапом."""
+    default = {"working": {}}
+    if not os.path.exists(STATE_FILE):
+        return default
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            text = f.read()
+        if not text.strip():
+            raise ValueError("файл пустой")
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("корень не является объектом")
+        data.setdefault("working", {})
+        return data
+    except (ValueError, OSError) as e:
+        print(f"[!] state.json не читается ({e}), начинаю с пустого состояния")
+        try:
+            os.replace(STATE_FILE, STATE_FILE + ".broken")
+        except OSError:
+            pass
+        return default
 
 
 def flag(cc):
@@ -66,7 +100,8 @@ def build_stream(q):
     net = q.get("type", "tcp")
     if net == "http":
         net = "h2"
-    # KeepAlive на уровне сокета xray
+
+    # TCP KeepAlive на уровне сокета xray
     st = {"network": net,
           "sockopt": {"tcpKeepAliveIdle": 30, "tcpKeepAliveInterval": 15}}
 
@@ -103,11 +138,10 @@ def build_stream(q):
 
 
 def parse_link(link):
-    """Возвращает dict с key, ob (outbound для xray), name, host, port, link или None."""
+    """Возвращает dict с key, ob (outbound для xray), host, port, link или None."""
     try:
         if link.startswith("vmess://"):
             d = json.loads(b64dec(link[8:]))
-            name = d.get("ps", "")
             host, port = d["add"], int(d["port"])
             net = d.get("net", "tcp")
             q = {"type": net, "path": d.get("path", ""), "host": d.get("host", ""),
@@ -123,7 +157,6 @@ def parse_link(link):
 
         else:
             u = up.urlsplit(link)
-            name = up.unquote(u.fragment)
             q = dict(up.parse_qsl(u.query))
 
             if link.startswith("vless://"):
@@ -161,8 +194,7 @@ def parse_link(link):
         ident = json.dumps({"p": ob["protocol"], "s": ob["settings"],
                             "st": ob.get("streamSettings")}, sort_keys=True)
         key = hashlib.sha1(ident.encode()).hexdigest()
-        return {"key": key, "ob": ob, "name": name, "host": host,
-                "port": port, "link": link}
+        return {"key": key, "ob": ob, "host": host, "port": port, "link": link}
     except Exception:
         return None
 
@@ -204,7 +236,7 @@ def wait_port(port, timeout=5):
 def ping_keepalive(ob, port):
     """
     Режим via Proxy GET + KeepAlive:
-    одна сессия xray, один requests.Session (одно переиспользуемое соединение),
+    один процесс xray, одна requests.Session (переиспользуемое соединение),
     два GET-запроса, результат - лучший из двух. Возвращает мс или None.
     """
     os.makedirs(TMP_DIR, exist_ok=True)
@@ -226,7 +258,6 @@ def ping_keepalive(ob, port):
 
         proxy = f"socks5h://127.0.0.1:{port}"
         timings = []
-        # одна сессия на все запросы = переиспользование TCP/TLS-соединения
         with requests.Session() as s:
             s.proxies = {"http": proxy, "https": proxy}
             for _ in range(PING_ATTEMPTS):
@@ -309,10 +340,7 @@ def geolocate(host):
 def main():
     os.makedirs(DATA, exist_ok=True)
 
-    state = {"working": {}}
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, encoding="utf-8") as f:
-            state = json.load(f)
+    state = load_state()
     working = state["working"]  # key -> метаданные
 
     # нерабочие: key -> строка для dead.txt (никогда не очищаются)
@@ -359,6 +387,7 @@ def main():
                 "ping": round(ping),
                 "cc": prev.get("cc"), "country": prev.get("country"),
             }
+            print(f"[ping] {p['host']} {round(ping)} ms")
         else:
             working.pop(k, None)
             dead[k] = f"{k} {p['host']}:{p['port']}"
@@ -392,8 +421,7 @@ def main():
         worker_lines.append(rename_link(info["link"], name))
     write_lines(WORKER_TXT, worker_lines)
 
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    save_json_atomic(STATE_FILE, state)
 
     print(f"[=] рабочих: {len(working)}, для воркера: {len(worker_lines)}, "
           f"нерабочих всего: {len(dead)}")
