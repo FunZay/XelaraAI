@@ -1,62 +1,64 @@
-name: parser
+name: Xelara Auto-Check & Sync
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
-  workflow_dispatch:
-  push:
-    paths:
-      - "data/subscriptions.txt"
+    # Запуск каждые 3 часа (в 00:00, 03:00, 06:00 и т.д. по UTC)
+    - cron: '0 */3 * * *'
+  workflow_dispatch: # Позволяет запустить вручную кнопкой в GitHub
 
 permissions:
-  contents: write
-
-concurrency:
-  group: parser
-  cancel-in-progress: false
+  contents: write # Нужно, чтобы бот мог коммитить обновленный latest.json
 
 jobs:
-  run:
+  check-and-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 120 # Если проверка зависнет, GitHub ее прибьет
+
     steps:
-      - uses: actions/checkout@v4
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
+          cache: 'pip' # Кэшируем зависимости, чтобы не качать каждый раз
 
-      - name: Install deps
-        run: pip install "requests[socks]"
-
-      - name: Install xray
+      - name: 📦 Install Dependencies
         run: |
-          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -o Xray-linux-64.zip xray geoip.dat geosite.dat -d .
-          chmod +x xray
-          ./xray version
+          python -m pip install --upgrade pip
+          # Базовые зависимости для xelara.py
+          pip install requests PySocks psutil aiohttp aiofiles PyYAML
 
-      - name: Run parser
-        run: python parser.py
+      - name: 🚀 Run Xelara Checker
+        # Скрипт находится в корне репозитория
+        run: |
+          python xelara.py -c 32 --timeout 10 --server-timeout 12
+        
+      - name: 💾 Commit and Push Results
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 Auto-update configs [skip ci]"
+          # Коммитим файлы из корня репозитория
+          file_pattern: "output/AllWorking/latest.json output/AllWorking/latest.txt working.txt cache.json"
+          commit_user_name: "Xelara Bot"
+          commit_user_email: "bot@xelara.local"
+
+      - name: 🔄 Trigger Worker Sync
+        # Дергаем API вашего воркера, чтобы он обновил БД
         env:
-          MAX_CHECKS: "400"
-          TIME_BUDGET: "1500"
-          CHECK_THREADS: "20"
-
-      - name: Commit results
+          # Мы жестко зашиваем ваш URL из сообщения
+          WORKER_URL: "https://adminvpn.xelaravpn.workers.dev"
+          # ADMIN_TOKEN нужно добавить в Secrets вашего репозитория
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
-          if git diff --cached --quiet; then
-            echo "Изменений нет"
+          if [ -z "$ADMIN_TOKEN" ]; then
+            echo "⚠️ Пропускаю синхронизацию воркера, так как секрет ADMIN_TOKEN не задан."
             exit 0
           fi
-          git commit -m "parser: update $(date -u +%F_%H-%M)"
-          for i in 1 2 3; do
-            git pull --rebase -X theirs origin main && git push origin HEAD:main && exit 0
-            echo "push не прошёл, повтор через 5 сек ($i/3)"
-            sleep 5
-          done
-          echo "Не удалось отправить изменения"
-          exit 1
+          
+          echo "Стучусь в воркер: $WORKER_URL/api/admin/sync"
+          curl -X POST "$WORKER_URL/api/admin/sync" \
+            -H "X-Token: $ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{}"
