@@ -4,8 +4,8 @@ import hashlib
 import json
 import os
 import queue
-import subprocess
 import socket
+import subprocess
 import time
 import urllib.parse as up
 from concurrent.futures import ThreadPoolExecutor
@@ -32,9 +32,10 @@ BASE_PORT = 20000
 MAX_CHECKS = int(os.environ.get("MAX_CHECKS", 400))
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", 1500))  # секунд на проверку
 
-GEO_VERSION = 2  # при смене логики определения страны старые cc сбрасываются
+GEO_VERSION = 2   # смена логики определения страны -> сброс cc
+KEY_VERSION = 3   # смена правил дедупликации -> пересчёт ключей
 
-PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://")
+PROTOCOLS = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
 UA = "v2rayNG/1.8.5"
 
 # Геосервисы вызываются ЧЕРЕЗ туннель: страна = страна выходного IP сервера
@@ -80,7 +81,7 @@ def save_json_atomic(path, data):
 
 
 def load_state():
-    default = {"servers": {}, "geo_version": 0}
+    default = {"servers": {}, "geo_version": 0, "key_version": 0}
     if not os.path.exists(STATE_FILE):
         return default
     try:
@@ -101,6 +102,7 @@ def load_state():
 
     data.setdefault("servers", {})
     data.setdefault("geo_version", 0)
+    data.setdefault("key_version", 0)
     # миграция со старого формата (ключ "working")
     for k, v in data.pop("working", {}).items():
         data["servers"].setdefault(k, {
@@ -199,10 +201,16 @@ def build_stream(q):
     return st
 
 
-def entry(proto, host, port, uid, ob, name, link):
+def canon_query(q):
+    """Параметры запроса без fp, отсортированные. Пустые значения не учитываются."""
+    items = sorted((k, v) for k, v in q.items() if k != "fp" and v not in ("", None))
+    return "&".join(f"{k}={v}" for k, v in items)
+
+
+def entry(canon, host, port, ob, name, link):
     if not host or not port:
         return None
-    key = hashlib.sha1(f"{proto}|{host.lower()}|{port}|{uid}".encode()).hexdigest()[:16]
+    key = hashlib.sha1(canon.encode("utf-8")).hexdigest()[:16]
     return {"key": key, "host": host, "port": port, "ob": ob, "name": name, "link": link}
 
 
@@ -228,7 +236,9 @@ def _parse_vmess(link):
                                              "alterId": int(d.get("aid", 0) or 0),
                                              "security": d.get("scy") or "auto"}]}]},
           "streamSettings": build_stream(q)}
-    return entry("vmess", host, port, uid, ob, d.get("ps", ""), link)
+    canon_d = {k: v for k, v in d.items() if k not in ("fp", "ps")}
+    canon = "vmess|" + json.dumps(canon_d, sort_keys=True, ensure_ascii=False)
+    return entry(canon, host, port, ob, d.get("ps", ""), link)
 
 
 def _parse_vless(link):
@@ -242,7 +252,8 @@ def _parse_vless(link):
     ob = {"protocol": "vless",
           "settings": {"vnext": [{"address": host, "port": port, "users": [user]}]},
           "streamSettings": build_stream(q)}
-    return entry("vless", host, port, uid, ob, up.unquote(u.fragment), link)
+    canon = f"vless|{uid}|{host.lower()}|{port}|{canon_query(q)}"
+    return entry(canon, host, port, ob, up.unquote(u.fragment), link)
 
 
 def _parse_trojan(link):
@@ -255,7 +266,30 @@ def _parse_trojan(link):
     ob = {"protocol": "trojan",
           "settings": {"servers": [{"address": host, "port": port, "password": pwd}]},
           "streamSettings": build_stream(q)}
-    return entry("trojan", host, port, pwd, ob, up.unquote(u.fragment), link)
+    canon = f"trojan|{pwd}|{host.lower()}|{port}|{canon_query(q)}"
+    return entry(canon, host, port, ob, up.unquote(u.fragment), link)
+
+
+def _parse_hysteria2(link):
+    u = up.urlsplit(link)
+    q = dict(up.parse_qsl(u.query, keep_blank_values=True))
+    host, port = u.hostname, u.port
+    auth = up.unquote(u.username or "")
+    if q.get("obfs"):
+        return None  # obfs требует отдельной настройки в Xray, пропускаем
+    sni = q.get("sni") or host
+    insecure = str(q.get("insecure", "0")).lower() in ("1", "true")
+    alpn = [a for a in (q.get("alpn") or "h3").split(",") if a]
+    ob = {"protocol": "hysteria",
+          "settings": {"version": 2, "address": host, "port": port},
+          "streamSettings": {
+              "network": "hysteria",
+              "security": "tls",
+              "tlsSettings": {"serverName": sni, "allowInsecure": insecure, "alpn": alpn},
+              "hysteriaSettings": {"version": 2, "auth": auth},
+          }}
+    canon = f"hy2|{auth}|{host.lower()}|{port}|{canon_query(q)}"
+    return entry(canon, host, port, ob, up.unquote(u.fragment), link)
 
 
 def _parse_ss(link):
@@ -264,8 +298,10 @@ def _parse_ss(link):
     if "#" in body:
         body, frag = body.split("#", 1)
         name = up.unquote(frag)
+    q = {}
     if "?" in body:
-        body = body.split("?", 1)[0]
+        body, qs = body.split("?", 1)
+        q = dict(up.parse_qsl(qs, keep_blank_values=True))
     if "@" in body:
         userinfo, hostport = body.rsplit("@", 1)
         if ":" not in userinfo:
@@ -279,7 +315,8 @@ def _parse_ss(link):
     ob = {"protocol": "shadowsocks",
           "settings": {"servers": [{"address": host, "port": port,
                                     "method": method, "password": password}]}}
-    return entry("ss", host, port, method + password, ob, name, link)
+    canon = f"ss|{method}|{password}|{host.lower()}|{port}|{canon_query(q)}"
+    return entry(canon, host, port, ob, name, link)
 
 
 def parse_link(raw):
@@ -291,6 +328,8 @@ def parse_link(raw):
             return _parse_vless(link)
         if link.startswith("trojan://"):
             return _parse_trojan(link)
+        if link.startswith(("hysteria2://", "hy2://")):
+            return _parse_hysteria2(link)
         if link.startswith("ss://"):
             return _parse_ss(link)
     except Exception:
@@ -435,7 +474,24 @@ def main():
     state = load_state()
     servers = state["servers"]
 
-    # одноразовый сброс стран, определённых по IP хоста (неверно для CDN/anycast)
+    # миграция ключей: пересчёт по новым правилам, схлопывание дублей
+    key_migrated = state.get("key_version") != KEY_VERSION
+    if key_migrated:
+        rebuilt = {}
+        for s in servers.values():
+            e = parse_link(s.get("link", ""))
+            if not e:
+                continue
+            if e["key"] in rebuilt and rebuilt[e["key"]].get("status") == "working":
+                continue
+            s["host"], s["port"] = e["host"], e["port"]
+            rebuilt[e["key"]] = s
+        servers = rebuilt
+        state["servers"] = servers
+        state["key_version"] = KEY_VERSION
+        print(f"[*] миграция ключей: {len(servers)} уникальных серверов")
+
+    # одноразовый сброс стран, определённых по IP хоста
     if state.get("geo_version") != GEO_VERSION:
         for s in servers.values():
             s["cc"] = None
@@ -444,11 +500,12 @@ def main():
         print("[*] миграция: страны сброшены, будут определены через туннель")
 
     dead_lines = {}
-    for line in read_lines(DEAD_FILE):
-        dead_lines[line.split()[0]] = line
+    if not key_migrated:
+        for line in read_lines(DEAD_FILE):
+            dead_lines[line.split()[0]] = line
     dead = set(dead_lines)
 
-    # 1. сбор серверов из подписок
+    # 1. сбор серверов из подписок (дубли по ключу отсекаются)
     fresh = {}
     for url in read_lines(SUBS_FILE):
         sub_id = hashlib.sha1(url.encode()).hexdigest()[:8]
@@ -467,6 +524,7 @@ def main():
     for k, (e, sub_id, pos) in fresh.items():
         if k in servers:
             servers[k]["link"] = e["link"]
+            servers[k]["host"], servers[k]["port"] = e["host"], e["port"]
         else:
             servers[k] = {
                 "link": e["link"], "host": e["host"], "port": e["port"],
@@ -518,17 +576,19 @@ def main():
                      cc=r["cc"], country=r["country"])
     print(f"[=] проверка: рабочих {ok}, мёртвых {bad}, не успели {skipped}")
 
-    # 3. сохранение
-    ordered = sorted([k for k, s in servers.items() if s["status"] == "working"],
-                     key=lambda k: (servers[k]["sub_id"], servers[k]["sub_pos"]))
+    # 3. итог: только рабочие со страной, без дублей
+    ordered = sorted(
+        [k for k, s in servers.items() if s["status"] == "working" and s.get("cc")],
+        key=lambda k: (servers[k]["sub_id"], servers[k]["sub_pos"]),
+    )
+    no_cc = sum(1 for s in servers.values() if s["status"] == "working" and not s.get("cc"))
+
     write_lines(WORKING_TXT, [servers[k]["link"] for k in ordered])
 
     worker_lines = []
     counter, cur_sub = 0, None
     for k in ordered:
         s = servers[k]
-        if not s.get("cc"):
-            continue
         if s["sub_id"] != cur_sub:
             cur_sub, counter = s["sub_id"], 0
         counter += 1
@@ -539,7 +599,7 @@ def main():
     write_lines(DEAD_FILE, sorted(dead_lines.values()))
     save_json_atomic(STATE_FILE, state)
 
-    print(f"[=] рабочих: {len(ordered)}, для воркера: {len(worker_lines)}, "
+    print(f"[=] в итоговых файлах: {len(ordered)}, рабочих без страны (не попали): {no_cc}, "
           f"мёртвых всего: {len(dead_lines)}, время: {int(time.time() - start)} сек")
 
 
