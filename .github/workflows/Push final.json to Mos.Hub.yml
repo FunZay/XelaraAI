@@ -1,0 +1,103 @@
+# .github/workflows/push-to-moshub.yml
+name: Push final.json to Mos.Hub
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'data/final.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moshub-sync
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify final.json
+        id: verify
+        run: |
+          set -euo pipefail
+          test -f data/final.json || { echo "::error::data/final.json не найден"; exit 1; }
+          jq empty data/final.json || { echo "::error::final.json — не валидный JSON"; exit 1; }
+          COUNT=$(jq length data/final.json)
+          test "$COUNT" -gt 0 || { echo "::error::final.json пустой"; exit 1; }
+          echo "configs=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Размер: $(wc -c < data/final.json) байт, конфигов: $COUNT"
+
+      - name: Push to Mos.Hub
+        env:
+          MOSHUB_TOKEN: "glpat-JCadm4b8tJcjiy8iVTx4"
+          # ⚠️ numeric Project ID из Settings → General → Advanced репозитория на Mos.Hub
+          MOSHUB_PROJECT: "12345"
+          MOSHUB_FILE: "final.json"
+          MOSHUB_BRANCH: "main"
+        run: |
+          set -euo pipefail
+          BASE_URL="https://hub.mos.ru"
+          PROJECT="${MOSHUB_PROJECT:?не задан MOSHUB_PROJECT (нужен numeric ID)}"
+          FILE="${MOSHUB_FILE:-final.json}"
+          BRANCH="${MOSHUB_BRANCH:-main}"
+
+          FILE_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FILE")
+
+          STATUS=$(curl -sS -o /tmp/head.json -w '%{http_code}' \
+            -H "PRIVATE-TOKEN: $MOSHUB_TOKEN" \
+            -H "User-Agent: curl/8.0" \
+            -H "Accept: application/json" \
+            "$BASE_URL/api/v4/projects/$PROJECT/repository/files/$FILE_ENC?ref=$BRANCH" || true)
+
+          if [ "$STATUS" = "200" ]; then
+            METHOD=PUT
+          elif [ "$STATUS" = "404" ]; then
+            METHOD=POST
+          else
+            echo "::error::Mos.Hub GET вернул $STATUS"
+            cat /tmp/head.json || true
+            exit 1
+          fi
+
+          CONTENT_B64=$(base64 -w0 data/final.json)
+
+          PAYLOAD=$(jq -n \
+            --arg branch  "$BRANCH" \
+            --arg content "$CONTENT_B64" \
+            --arg msg     "Sync from Xelara CI · $(date -u +%FT%TZ)" \
+            --arg an      "Xelara CI" \
+            --arg ae      "ci@xelara.local" \
+            '{branch:$branch, content:$content, encoding:"base64",
+              commit_message:$msg, author_name:$an, author_email:$ae}')
+
+          RESP=$(curl -sS -w '\n%{http_code}' -X "$METHOD" \
+            -H "PRIVATE-TOKEN: $MOSHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: curl/8.0" \
+            -d "$PAYLOAD" \
+            "$BASE_URL/api/v4/projects/$PROJECT/repository/files/$FILE_ENC")
+
+          BODY=$(echo "$RESP" | head -n -1)
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "Mos.Hub $METHOD → $CODE"
+          echo "$BODY" | head -c 1000; echo
+
+          if [ "$CODE" != "200" ] && [ "$CODE" != "201" ]; then
+            echo "::error::Mos.Hub вернул $CODE"
+            exit 1
+          fi
+
+          COMMIT=$(echo "$BODY" | jq -r '.commit_id // "?"')
+          {
+            echo "### ✅ Mos.Hub обновлён"
+            echo "- Файл: \`$FILE\`"
+            echo "- Ветка: \`$BRANCH\`"
+            echo "- Конфигов: **${{ steps.verify.outputs.configs }}**"
+            echo "- Commit: \`${COMMIT:0:12}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
