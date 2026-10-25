@@ -3,7 +3,7 @@
 """
 Combined Source Loader + Xray Parser & Checker
 ============================================
-v-dbl: добавлена двойная проверка.
+v-dbl: двойная проверка.
         Первый проход по всем серверам.
         Упавшие уходят в конец очереди и проверяются второй раз.
         Если не ответили и второй раз — выбрасываются из кэша
@@ -11,6 +11,11 @@ v-dbl: добавлена двойная проверка.
         Список выброшенных пишется в discarded.txt (URI + причина).
         Отключить: --no-double-check.
         Сохранить в UnWorking после второго фейла: --keep-failed.
+v-speed: реальный замер скорости скачивания и отдачи через прокси.
+        Сервер проходит только если скачивание и отдача выше порогов.
+        Иначе помечается ok=False и в Working не попадает.
+        Отключить: --no-speed. Пороги: --min-down / --min-up.
+        Отчёт: AllWorking/speeds.txt
 """
 
 import importlib, subprocess, sys
@@ -105,6 +110,18 @@ SERVER_TIMEOUT_DEFAULT = 8.0
 
 TEST_URLS_FALLBACK = ["https://www.gstatic.com/generate_204"]
 IP_URL = "https://api.ipify.org"
+
+# --- Speed test ---
+SPEED_DOWN_URLS = [
+    "https://speed.cloudflare.com/__down?bytes=2000000",
+    "https://speed.cloudflare.com/__down?bytes=1000000",
+    "https://proof.ovh.net/files/1Mb.dat",
+]
+SPEED_UP_URLS = [
+    "https://speed.cloudflare.com/__up",
+    "https://httpbin.org/post",
+]
+SPEED_UP_BYTES = 1_000_000
 
 COUNTRY_SOURCES = [
     ("http://ip-api.com/json/?fields=status,countryCode,country,query", "ip-api"),
@@ -209,6 +226,48 @@ def _extra_hash(ex):
         ).hexdigest()[:10]
     except Exception:
         return ""
+
+# ============================================================================
+# Замер скорости
+# ============================================================================
+def _measure_download_speed(session, timeout):
+    """Качает данные через прокси, возвращает Mbps или None."""
+    for url in SPEED_DOWN_URLS:
+        t0 = time.perf_counter()
+        total = 0
+        try:
+            with session.get(url, timeout=timeout, stream=True,
+                             headers={"Accept-Encoding": "identity"}) as r:
+                if r.status_code != 200:
+                    continue
+                for chunk in r.iter_content(65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if time.perf_counter() - t0 > timeout:
+                        break
+        except Exception:
+            continue
+        dt = time.perf_counter() - t0
+        if total >= 10_000 and dt > 0.05:
+            return round((total * 8) / (dt * 1_000_000), 2)
+    return None
+
+def _measure_upload_speed(session, timeout):
+    """Заливает данные через прокси, возвращает Mbps или None."""
+    payload = b"\0" * SPEED_UP_BYTES
+    for url in SPEED_UP_URLS:
+        t0 = time.perf_counter()
+        try:
+            r = session.post(url, data=payload, timeout=timeout, stream=True)
+            dt = time.perf_counter() - t0
+            ok_status = r.status_code in (200, 201, 204)
+            r.close()
+            if ok_status and dt > 0.05:
+                return round((SPEED_UP_BYTES * 8) / (dt * 1_000_000), 2)
+        except Exception:
+            continue
+    return None
 
 # ============================================================================
 # Конвертеры JSON/YAML → URI (из loader'а)
@@ -1059,6 +1118,7 @@ class Cache:
                       "name": pr.name, "raw": pr.raw or dump_to_uri(pr),
                       "status": "unworking", "first_sub_index": sub_index,
                       "latency": None, "latency_keepalive": None,
+                      "download_mbps": None, "upload_mbps": None,
                       "country_code": "", "country": "",
                       "ip": None, "test_url": None, "error": None,
                       "elapsed": None,
@@ -1080,6 +1140,8 @@ class Cache:
             it["last_checked"] = _now()
             it["latency"] = result.get("latency")
             it["latency_keepalive"] = result.get("latency_keepalive")
+            it["download_mbps"] = result.get("download_mbps")
+            it["upload_mbps"] = result.get("upload_mbps")
             it["ip"] = result.get("ip")
             it["error"] = result.get("error")
             it["elapsed"] = result.get("elapsed")
@@ -1346,7 +1408,9 @@ def _detect_country(session, timeout):
     return "", "", ""
 
 def check_proxy(pr, xray, timeout=8.0, send_through=None,
-                prior_cc="", server_timeout=None):
+                prior_cc="", server_timeout=None,
+                speed_test=True, speed_timeout=5.0,
+                min_down=0.05, min_up=0.02, require_upload=True):
     budget = server_timeout if server_timeout is not None else SERVER_TIMEOUT_DEFAULT
     t_start = time.time()
 
@@ -1385,6 +1449,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             except Exception:
                 pass
             return {"ok": False, "latency": None, "latency_keepalive": None,
+                    "download_mbps": None, "upload_mbps": None,
                     "ip": None, "country_code": "", "country": "",
                     "test_url": None, "error": msg,
                     "elapsed": round(time.time() - t_start, 2)}
@@ -1421,6 +1486,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
         if working_url is None:
             session.close()
             return {"ok": False, "latency": None, "latency_keepalive": None,
+                    "download_mbps": None, "upload_mbps": None,
                     "ip": None, "country_code": "", "country": "",
                     "test_url": None, "error": last_err,
                     "elapsed": round(time.time() - t_start, 2)}
@@ -1436,6 +1502,26 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                     lat_ka = None
             except Exception:
                 lat_ka = None
+
+        # ---- Замер скорости: мёртвые/слишком медленные не должны пройти ----
+        down_mbps = None
+        up_mbps = None
+        if speed_test:
+            down_mbps = _measure_download_speed(session, speed_timeout)
+            if require_upload:
+                up_mbps = _measure_upload_speed(session, speed_timeout)
+            speed_ok = (down_mbps is not None and down_mbps >= min_down)
+            if require_upload:
+                speed_ok = speed_ok and (up_mbps is not None and up_mbps >= min_up)
+            if not speed_ok:
+                session.close()
+                err = (f"dead/too slow: ↓{down_mbps} ↑{up_mbps} Mbps "
+                       f"(min ↓{min_down} ↑{min_up})")
+                return {"ok": False, "latency": lat, "latency_keepalive": lat_ka,
+                        "download_mbps": down_mbps, "upload_mbps": up_mbps,
+                        "ip": None, "country_code": "", "country": "",
+                        "test_url": working_url, "error": err,
+                        "elapsed": round(time.time() - t_start, 2)}
 
         cc, cn, ip = "", "", ""
         country_budget = min(remaining(), 3.0)
@@ -1460,6 +1546,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
 
         session.close()
         return {"ok": True, "latency": lat, "latency_keepalive": lat_ka,
+                "download_mbps": down_mbps, "upload_mbps": up_mbps,
                 "ip": ip, "country_code": cc, "country": cn,
                 "test_url": working_url, "error": None,
                 "elapsed": round(time.time() - t_start, 2)}
@@ -1638,6 +1725,9 @@ class OutputWriter:
     def write_unworking_all(self, proxies):
         self._write_list(self.unworking / "all.txt", proxies)
 
+    def write_speeds(self, lines):
+        self._write_lines(self.allworking / "speeds.txt", lines)
+
     def write_versioned_all_working(self, lines):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         snap = self.allworking / f"all_{ts}.txt"
@@ -1707,27 +1797,20 @@ def _named_lines(cache, proxies):
     return lines
 
 # ============================================================================
-# Параллельная проверка — v-dbl: двойная проверка
+# Параллельная проверка — v-dbl + v-speed
 # ============================================================================
 def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     concurrency, server_timeout=SERVER_TIMEOUT_DEFAULT,
+                    speed_test=True, speed_timeout=5.0,
+                    min_down=0.05, min_up=0.02, require_upload=True,
                     double_check=True, discard_failed=True,
                     discard_log=DISCARD_FILE):
     """
     v-dbl: двойная проверка.
-      - Первый проход по всем серверам.
-      - Упавшие (r["ok"] == False) уходят в конец очереди.
-      - Второй проход только по упавшим.
-      - Упавшие и второй раз выбрасываются из кэша
-        (и не попадают ни в Working, ни в UnWorking).
-        Строка о выбросе пишется в discard_log (URI + причина).
-      - double_check=False: одноразовая проверка (старое поведение).
-      - discard_failed=False: неудачники после второго раза остаются
-        в кэше как unworking (попадут в UnWorking/all.txt).
+    v-speed: реальный замер скорости (↓ / ↑) перед пометкой working.
     """
     results = {}
 
-    # очищаем лог при старте, если он есть (не дописываем через прогоны)
     if double_check and discard_failed and discard_log:
         try:
             Path(discard_log).write_text("", encoding="utf-8")
@@ -1743,7 +1826,6 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                 continue
 
         def _run_batch(batch, pass_label):
-            """Один проход по batch в потоках. Возвращает [(pr, r), ...]."""
             if not batch:
                 return []
             pairs = []
@@ -1758,7 +1840,10 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                 if it and it.get("country_code"):
                     prior = it["country_code"]
                 r = check_proxy(pr, xray, timeout, send_through,
-                                prior_cc=prior, server_timeout=server_timeout)
+                                prior_cc=prior, server_timeout=server_timeout,
+                                speed_test=speed_test, speed_timeout=speed_timeout,
+                                min_down=min_down, min_up=min_up,
+                                require_upload=require_upload)
                 cache.upsert(pr, r, sub_index)
                 with lock:
                     pairs.append((pr, r))
@@ -1766,6 +1851,12 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     n = done[0]
                 label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
                 with print_lock:
+                    dn = r.get("download_mbps")
+                    up = r.get("upload_mbps")
+                    sp_s = ""
+                    if dn is not None or up is not None:
+                        sp_s = (f" ↓{dn if dn is not None else '—'}Mbps "
+                                f"↑{up if up is not None else '—'}Mbps")
                     if r["ok"]:
                         flag = flag_from_cc(r.get("country_code", ""))
                         cn = country_ru(r.get("country_code", ""))
@@ -1774,22 +1865,20 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                         el = r.get("elapsed")
                         el_s = f" {el}s" if el is not None else ""
                         print(f"  {pass_label} [{n}/{total}] OK {flag} {cn} {r['latency']}ms "
-                              f"{ka_s}{el_s} ip={r['ip']} | {label}")
+                              f"{ka_s}{sp_s}{el_s} ip={r['ip']} | {label}")
                     else:
                         el = r.get("elapsed")
                         el_s = f" {el}s" if el is not None else ""
-                        print(f"  {pass_label} [{n}/{total}] FAIL{el_s} {r['error']} | {label}")
+                        print(f"  {pass_label} [{n}/{total}] FAIL{sp_s}{el_s} {r['error']} | {label}")
 
             with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
                 list(ex.map(_w, batch))
             return pairs
 
-        # ---------- Первый проход: все прокси ----------
         first_pairs = _run_batch(proxies, "1st")
         final_pairs = [(pr, r) for pr, r in first_pairs if r["ok"]]
         failed = [pr for pr, r in first_pairs if not r["ok"]]
 
-        # ---------- Второй проход: только упавшие ----------
         if double_check and failed:
             print(f"\n  ⟳ Двойная проверка: {len(failed)} серверов без ответа, "
                   f"ставлю в конец очереди...")
@@ -1815,12 +1904,10 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                             except Exception:
                                 pass
                 else:
-                    # не выбрасываем — оставляем как unworking (попадут в UnWorking/all.txt)
                     final_pairs.extend(still_failed)
             else:
                 print(f"\n  ✓ После второй проверки восстановились: {len(success_retry)}")
         elif failed and not double_check:
-            # double_check выключен — все упавшие остаются в результате как unworking
             final_pairs.extend([(pr, r) for pr, r in first_pairs if not r["ok"]])
 
         results[iface_key] = final_pairs
@@ -1843,6 +1930,22 @@ def _write_final(cache, writer, sources_count, final_file="working.txt"):
     lines_all = _named_lines(cache, all_working)
     writer.write_working_all(lines_all)
     print(f"[i] Working/all.txt: {len(all_working)} рабочих")
+
+    # Отчёт по скоростям
+    speed_lines = []
+    for v in cache.items.values():
+        if v.get("status") != "working":
+            continue
+        dn = v.get("download_mbps")
+        up = v.get("upload_mbps")
+        if dn is None and up is None:
+            continue
+        p = cache.to_proxy(v)
+        lat = v.get("latency")
+        speed_lines.append(f"↓{dn}Mbps\t↑{up}Mbps\t{lat}ms\t{dump_to_uri(p)}")
+    if speed_lines:
+        writer.write_speeds(speed_lines)
+        print(f"[i] AllWorking/speeds.txt: {len(speed_lines)} строк")
 
     all_unworking = cache.unworking_all()
     writer.write_unworking_all(all_unworking)
@@ -1882,11 +1985,9 @@ def _collect_proxies_from_uris(uris):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Combined Source Loader + Xray Checker (with double-check)")
-    # Loader
+        description="Combined Source Loader + Xray Checker (double-check + speed)")
     ap.add_argument("--no-load", action="store_true",
                     help="не скачивать sources.txt (только проверять уже собранное)")
-    # Checker
     ap.add_argument("-i", "--input", default=CONFIGS_FILE,
                     help="файл с конфигами (по умолчанию configs.txt)")
     ap.add_argument("-o", "--output-dir", default="output")
@@ -1905,7 +2006,6 @@ def main():
     ap.add_argument("--no-recheck-final", action="store_true",
                     help="не перепроверять файлы из --recheck-files")
 
-    # v-dbl: двойная проверка
     ap.add_argument("--no-double-check", action="store_true",
                     help="не перепроверять серверы, которые не ответили с первого раза")
     ap.add_argument("--keep-failed", action="store_true",
@@ -1913,6 +2013,18 @@ def main():
                          "(попадут в UnWorking/all.txt). По умолчанию они выбрасываются.")
     ap.add_argument("--discard-log", default=DISCARD_FILE,
                     help=f"лог выброшенных серверов (default: {DISCARD_FILE})")
+
+    # --- Speed test ---
+    ap.add_argument("--no-speed", action="store_true",
+                    help="не замерять скорость скачивания/отдачи (старое поведение)")
+    ap.add_argument("--speed-timeout", type=float, default=5.0,
+                    help="таймаут одного замера скорости, сек (default: 5)")
+    ap.add_argument("--min-down", type=float, default=0.05,
+                    help="мин. скорость скачивания, Mbps (default: 0.05)")
+    ap.add_argument("--min-up", type=float, default=0.02,
+                    help="мин. скорость отдачи, Mbps (default: 0.02)")
+    ap.add_argument("--no-upload-check", action="store_true",
+                    help="проверять только скачивание, отдачу не требовать")
 
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
@@ -1922,9 +2034,13 @@ def main():
     if args.concurrency < 1:  args.concurrency = 1
     if args.concurrency > 64: args.concurrency = 64
 
-    # Единый набор параметров для всех вызовов _check_parallel
     check_kwargs = dict(
         server_timeout=args.server_timeout,
+        speed_test=not args.no_speed,
+        speed_timeout=args.speed_timeout,
+        min_down=args.min_down,
+        min_up=args.min_up,
+        require_upload=not args.no_upload_check,
         double_check=not args.no_double_check,
         discard_failed=not args.keep_failed,
         discard_log=args.discard_log,
@@ -1933,9 +2049,6 @@ def main():
     cache = Cache(Path(args.cache))
     writer = OutputWriter(Path(args.output_dir))
 
-    # ---------------------------------------------------------------
-    # Фаза 1: Загрузка источников + my_configs → configs.txt
-    # ---------------------------------------------------------------
     extra_uris_from_loader = []
     if not args.only_old and not args.no_load:
         loaded, my_cfgs, _stats = asyncio.run(load_http_sources())
@@ -1959,6 +2072,8 @@ def main():
     print(f"[i] параллельно: {args.concurrency} | бюджет на сервер: {args.server_timeout}s")
     print(f"[i] двойная проверка: {'ВКЛ' if check_kwargs['double_check'] else 'ВЫКЛ'} "
           f"| выбрасывать после 2 фейлов: {'ДА' if check_kwargs['discard_failed'] else 'НЕТ'}")
+    print(f"[i] скорость: {'ВКЛ' if check_kwargs['speed_test'] else 'ВЫКЛ'} "
+          f"(↓{args.min_down} / ↑{args.min_up} Mbps, таймаут {args.speed_timeout}s)")
     print(f"[i] в кэше: {len(cache.items)} записей "
           f"(working={sum(1 for v in cache.items.values() if v.get('status')=='working')}, "
           f"unworking={sum(1 for v in cache.items.values() if v.get('status')=='unworking')})")
@@ -1973,9 +2088,6 @@ def main():
         ifaces["mobile"] = args.mobile_iface
         ifaces.pop("default", None)
 
-    # ---------------------------------------------------------------
-    # Фаза 2: Сбор Proxy-объектов для проверки
-    # ---------------------------------------------------------------
     input_path = Path(args.input)
     file_uris = []
     if input_path.exists():
@@ -1995,7 +2107,6 @@ def main():
     proxies = _collect_proxies_from_uris(all_uris)
     print(f"[i] распарсено URI: {len(all_uris)} → валидных Proxy: {len(proxies)}")
 
-    # Recheck файлов
     prev_final_proxies = []
     if not args.no_recheck_final and not args.only_new:
         paths = [s.strip() for s in args.recheck_files.split(",") if s.strip()]
@@ -2004,9 +2115,6 @@ def main():
         if prev_final_proxies:
             print(f"[i] всего для перепроверки из файлов: {len(prev_final_proxies)}")
 
-    # ---------------------------------------------------------------
-    # Режимы
-    # ---------------------------------------------------------------
     if args.only_old:
         cached = []
         for it in cache.items.values():
@@ -2037,7 +2145,6 @@ def main():
         _write_final(cache, writer, len(sources) or 1, args.final_file)
         return
 
-    # Режим all
     uniq = _dedup(proxies)
     if uniq:
         print(f"\n{'='*70}")
