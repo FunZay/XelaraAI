@@ -2,20 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Combined Source Loader + Xray Parser & Checker
-============================================
-v-dbl: двойная проверка.
-        Первый проход по всем серверам.
-        Упавшие уходят в конец очереди и проверяются второй раз.
-        Если не ответили и второй раз — выбрасываются из кэша
-        и не попадают в UnWorking/all.txt.
-        Список выброшенных пишется в discarded.txt (URI + причина).
-        Отключить: --no-double-check.
-        Сохранить в UnWorking после второго фейла: --keep-failed.
-v-speed: реальный замер скорости скачивания и отдачи через прокси.
-        Сервер проходит только если скачивание и отдача выше порогов.
-        Иначе помечается ok=False и в Working не попадает.
-        Отключить: --no-speed. Пороги: --min-down / --min-up.
-        Отчёт: AllWorking/speeds.txt
+v-dbl + v-speed + v-stable + v-new
+  ⚡ = стабильный (>=3 успехов, >=80% rate, >=2 подряд, работал за 72ч)
+  🟢 = новый (first_seen не старше 24ч)
+  без метки = обычный
+Отдельные выводы: stable.txt / stable_latest.json, new.txt / new_latest.json
 """
 
 import importlib, subprocess, sys
@@ -105,13 +96,12 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 HWID_STATIC = "d060e73eb61d1ba7"
 HAPP_USER_AGENTS = ["Happ/3.18.3/Android/17771400994551771562"]
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 SERVER_TIMEOUT_DEFAULT = 8.0
 
 TEST_URLS_FALLBACK = ["https://www.gstatic.com/generate_204"]
 IP_URL = "https://api.ipify.org"
 
-# --- Speed test ---
 SPEED_DOWN_URLS = [
     "https://speed.cloudflare.com/__down?bytes=2000000",
     "https://speed.cloudflare.com/__down?bytes=1000000",
@@ -131,6 +121,15 @@ COUNTRY_SOURCES = [
 ]
 _COUNTRY_SEM = threading.Semaphore(3)
 
+STATUS_MARKERS = {"stable": "⚡", "new": "🟢", "regular": ""}
+
+def marker_for(cluster, stable_cfg=None, new_cfg=None):
+    if cluster == "stable":
+        return (stable_cfg or {}).get("marker", STATUS_MARKERS["stable"])
+    if cluster == "new":
+        return (new_cfg or {}).get("marker", STATUS_MARKERS["new"])
+    return ""
+
 # ============================================================================
 # Регулярки
 # ============================================================================
@@ -143,7 +142,7 @@ UUID_REGEX    = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-
 URI_REGEX     = re.compile(r"(?:vless|vmess|trojan|ss)://[^\s\"'<>]+")
 
 # ============================================================================
-# Русские названия стран
+# Страны
 # ============================================================================
 COUNTRY_RU = {
     "RU": "Россия", "DE": "Германия", "NL": "Нидерланды", "SE": "Швеция",
@@ -181,7 +180,7 @@ def country_ru(cc, fallback=""):
     return "Европа"
 
 # ============================================================================
-# Общие утилиты
+# Утилиты
 # ============================================================================
 def clean_text(text: str) -> str:
     if not text:
@@ -228,10 +227,9 @@ def _extra_hash(ex):
         return ""
 
 # ============================================================================
-# Замер скорости
+# Скорость
 # ============================================================================
 def _measure_download_speed(session, timeout):
-    """Качает данные через прокси, возвращает Mbps или None."""
     for url in SPEED_DOWN_URLS:
         t0 = time.perf_counter()
         total = 0
@@ -254,7 +252,6 @@ def _measure_download_speed(session, timeout):
     return None
 
 def _measure_upload_speed(session, timeout):
-    """Заливает данные через прокси, возвращает Mbps или None."""
     payload = b"\0" * SPEED_UP_BYTES
     for url in SPEED_UP_URLS:
         t0 = time.perf_counter()
@@ -270,7 +267,7 @@ def _measure_upload_speed(session, timeout):
     return None
 
 # ============================================================================
-# Конвертеры JSON/YAML → URI (из loader'а)
+# Конвертеры JSON/YAML → URI
 # ============================================================================
 def safe_quote(s: str) -> str:
     return urllib.parse.quote(s, safe='')
@@ -573,7 +570,6 @@ def decode_base64_content(content: str) -> Tuple[Optional[str], List[str]]:
         return None, []
 
 def extract_configs_from_text(text: str):
-    """Возвращает (vless_list, trojan_list, hy2_list, b64_cnt, json_cnt, yaml_cnt)."""
     vless_list, trojan_list, hy2_list = [], [], []
     base64_count = json_count = yaml_count = 0
 
@@ -610,7 +606,7 @@ def extract_configs_from_text(text: str):
     return vless_list, trojan_list, hy2_list, base64_count, json_count, yaml_count
 
 # ============================================================================
-# Резервный Happ-метод
+# Happ-фолбэк
 # ============================================================================
 def fetch_with_happ_method(url: str) -> Optional[str]:
     parsed = urllib.parse.urlparse(url)
@@ -644,7 +640,7 @@ def fetch_with_happ_method(url: str) -> Optional[str]:
     return None
 
 # ============================================================================
-# Асинхронная загрузка источников
+# Загрузка источников
 # ============================================================================
 async def process_source(session, url, sem, stats, stats_lock):
     async with sem:
@@ -712,8 +708,6 @@ async def display_progress(stats):
         await asyncio.sleep(0.3)
 
 async def load_http_sources():
-    """Загружает sources.txt, извлекает конфиги, сохраняет в configs.txt.
-    Возвращает (all_configs, my_configs, stats)."""
     print("\n" + "=" * 60)
     print("Скачивание конфигураций из источников.")
     print("=" * 60)
@@ -799,7 +793,7 @@ async def load_http_sources():
     return stats['all_configs'], my_configs, stats
 
 # ============================================================================
-# Proxy dataclass + URI-парсер
+# Proxy + парсер URI
 # ============================================================================
 @dataclass
 class Proxy:
@@ -1088,7 +1082,7 @@ def dump_to_uri(pr, override_name=None):
     return pr.raw or ""
 
 # ============================================================================
-# Кэш
+# Cache
 # ============================================================================
 class Cache:
     def __init__(self, path):
@@ -1123,7 +1117,9 @@ class Cache:
                       "ip": None, "test_url": None, "error": None,
                       "elapsed": None,
                       "first_seen": _now(), "last_checked": None,
-                      "last_working": None, "fail_count": 0, "aliases": []}
+                      "last_working": None, "fail_count": 0, "aliases": [],
+                      "consecutive_ok": 0, "total_checks": 0, "total_ok": 0,
+                      "first_working": None}
             else:
                 if pr.raw:
                     it["raw"] = pr.raw
@@ -1136,6 +1132,11 @@ class Cache:
                     it["name"] = pr.name
                 if "first_sub_index" not in it:
                     it["first_sub_index"] = sub_index
+                it.setdefault("consecutive_ok", 0)
+                it.setdefault("total_checks", 0)
+                it.setdefault("total_ok", 0)
+                it.setdefault("first_working", None)
+                it.setdefault("first_seen", _now())
 
             it["last_checked"] = _now()
             it["latency"] = result.get("latency")
@@ -1148,13 +1149,20 @@ class Cache:
             it["country_code"] = result.get("country_code") or it.get("country_code", "") or ""
             it["country"]      = result.get("country")      or it.get("country", "")      or ""
             it["test_url"]     = result.get("test_url")
+
+            it["total_checks"] = int(it.get("total_checks", 0)) + 1
             if result.get("ok"):
                 it["status"] = "working"
                 it["last_working"] = _now()
                 it["fail_count"] = 0
+                it["consecutive_ok"] = int(it.get("consecutive_ok", 0)) + 1
+                it["total_ok"] = int(it.get("total_ok", 0)) + 1
+                if not it.get("first_working"):
+                    it["first_working"] = it["last_working"]
             else:
                 it["status"] = "unworking"
                 it["fail_count"] = int(it.get("fail_count", 0)) + 1
+                it["consecutive_ok"] = 0
             self.items[key] = it
             return it
 
@@ -1176,6 +1184,69 @@ class Cache:
             if v.get("status") == "working" and v.get("params", {}).get("server"):
                 m.setdefault(v.get("first_sub_index", 0), []).append(self.to_proxy(v))
         return m
+
+    def is_stable(self, item, min_checks=3, min_rate=0.8,
+                  min_consecutive=2, recent_hours=72):
+        if not item or item.get("status") != "working":
+            return False
+        total = int(item.get("total_checks", 0))
+        ok = int(item.get("total_ok", 0))
+        if total < min_checks or ok < min_checks:
+            return False
+        if total > 0 and (ok / total) < min_rate:
+            return False
+        if int(item.get("consecutive_ok", 0)) < min_consecutive:
+            return False
+        lw = item.get("last_working")
+        if not lw:
+            return False
+        try:
+            dt = datetime.strptime(lw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - dt).total_seconds() > recent_hours * 3600:
+                return False
+        except Exception:
+            return False
+        return True
+
+    def stable_all(self, min_checks=3, min_rate=0.8,
+                   min_consecutive=2, recent_hours=72):
+        return [self.to_proxy(v) for v in self.items.values()
+                if self.is_stable(v, min_checks=min_checks, min_rate=min_rate,
+                                  min_consecutive=min_consecutive,
+                                  recent_hours=recent_hours)
+                and v.get("params", {}).get("server")]
+
+    def is_new(self, item, recent_hours=24.0):
+        if not item or item.get("status") != "working":
+            return False
+        fs = item.get("first_seen")
+        if not fs:
+            return False
+        try:
+            dt = datetime.strptime(fs, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except Exception:
+            return False
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= recent_hours * 3600
+
+    def new_all(self, recent_hours=24.0):
+        return [self.to_proxy(v) for v in self.items.values()
+                if self.is_new(v, recent_hours=recent_hours)
+                and v.get("params", {}).get("server")]
+
+    def classify(self, item, stable_cfg=None, new_cfg=None):
+        if not item:
+            return "regular"
+        if (stable_cfg and stable_cfg.get("enabled", True)
+                and self.is_stable(item,
+                    min_checks=stable_cfg.get("min_checks", 3),
+                    min_rate=stable_cfg.get("min_rate", 0.8),
+                    min_consecutive=stable_cfg.get("min_consecutive", 2),
+                    recent_hours=stable_cfg.get("recent_hours", 72))):
+            return "stable"
+        if (new_cfg and new_cfg.get("enabled", True)
+                and self.is_new(item, recent_hours=new_cfg.get("recent_hours", 24))):
+            return "new"
+        return "regular"
 
 # ============================================================================
 # Xray Manager
@@ -1503,7 +1574,6 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             except Exception:
                 lat_ka = None
 
-        # ---- Замер скорости: мёртвые/слишком медленные не должны пройти ----
         down_mbps = None
         up_mbps = None
         if speed_test:
@@ -1562,7 +1632,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
         cp.unlink(missing_ok=True)
 
 # ============================================================================
-# Утилиты для сборки отчётов
+# Отчёты
 # ============================================================================
 def fetch_url(url, timeout=20):
     try:
@@ -1626,15 +1696,18 @@ def _load_recheck_files(paths):
         result.extend(parsed)
     return _dedup(result)
 
-def _build_country_config(cc, cn, servers):
+def _build_country_config(cc, cn, servers, cluster="regular",
+                          stable_cfg=None, new_cfg=None):
     flag = flag_from_cc(cc) if cc else "🏳️"
     name = cn or country_ru(cc)
-    remarks = f"{flag} {name} | @XelaraVpn"
-    prefix = (cc or "xx").lower()
+    mark = marker_for(cluster, stable_cfg, new_cfg)
+    prefix = f"{mark} " if mark else ""
+    remarks = f"{prefix}{flag} {name} | @XelaraVpn"
+    prefix_id = (cc or "xx").lower()
 
     outbounds, tags = [], []
     for i, (pr, _r) in enumerate(servers, 1):
-        tag = f"{prefix}-{i}"
+        tag = f"{prefix_id}-{i}"
         ob = _outbound(pr)
         ob["tag"] = tag
         outbounds.append(ob)
@@ -1642,7 +1715,7 @@ def _build_country_config(cc, cn, servers):
     outbounds.append({"protocol": "freedom", "tag": "direct"})
     outbounds.append({"protocol": "blackhole", "tag": "block"})
 
-    balancer_tag = f"{prefix}-balancer"
+    balancer_tag = f"{prefix_id}-balancer"
     balancer = {
         "tag": balancer_tag,
         "selector": tags,
@@ -1663,6 +1736,7 @@ def _build_country_config(cc, cn, servers):
 
     return {
         "remarks": remarks,
+        "_cluster": cluster,
         "log": {"loglevel": "warning"},
         "dns": {"queryStrategy": "UseIP",
                 "servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]},
@@ -1739,22 +1813,39 @@ class OutputWriter:
             self._write_lines(latest, lines)
         return snap, latest
 
-    def write_latest_json(self, cache):
+    def write_latest_json(self, cache, stable_cfg=None, new_cfg=None):
         by_country = defaultdict(list)
         for v in cache.items.values():
             if v.get("status") != "working":
                 continue
-            params = v.get("params") or {}
-            if not params.get("server"):
+            if not (v.get("params") or {}).get("server"):
                 continue
             cc = v.get("country_code") or ""
             p = cache.to_proxy(v)
-            by_country[cc].append((p, {"latency": v.get("latency")}))
+            cluster = cache.classify(v, stable_cfg, new_cfg)
+            by_country[cc].append((p, {"latency": v.get("latency")}, cluster))
 
         configs = []
         for cc in sorted(by_country.keys()):
             cn_ru = country_ru(cc)
-            configs.append(_build_country_config(cc, cn_ru, by_country[cc]))
+            rows = by_country[cc]
+            clusters = [c for _, _, c in rows]
+            if "stable" in clusters:
+                country_cluster = "stable"
+            elif clusters and all(c == "new" for c in clusters):
+                country_cluster = "new"
+            else:
+                country_cluster = "regular"
+            cfg = _build_country_config(cc, cn_ru, [(p, r) for p, r, _ in rows],
+                                        cluster=country_cluster,
+                                        stable_cfg=stable_cfg, new_cfg=new_cfg)
+            cfg["_counts"] = {
+                "stable":  clusters.count("stable"),
+                "new":     clusters.count("new"),
+                "regular": clusters.count("regular"),
+                "total":   len(clusters),
+            }
+            configs.append(cfg)
 
         latest = self.allworking / "latest.json"
         latest.write_text(json.dumps(configs, ensure_ascii=False, indent=1),
@@ -1766,6 +1857,43 @@ class OutputWriter:
         except Exception:
             snap.write_text(json.dumps(configs), encoding="utf-8")
         return latest, snap
+
+    def _write_cluster_bundle(self, name, cache, proxies, cluster,
+                              stable_cfg=None, new_cfg=None):
+        txt_path = self.allworking / f"{name}.txt"
+        self._write_lines(txt_path,
+            _named_lines(cache, proxies, stable_cfg=stable_cfg, new_cfg=new_cfg))
+
+        by_country = defaultdict(list)
+        for p in proxies:
+            it = cache.items.get(p.dedup_key(), {})
+            cc = it.get("country_code") or ""
+            by_country[cc].append((p, {"latency": it.get("latency")}))
+
+        configs = []
+        for cc in sorted(by_country.keys()):
+            configs.append(_build_country_config(
+                cc, country_ru(cc), by_country[cc],
+                cluster=cluster, stable_cfg=stable_cfg, new_cfg=new_cfg))
+
+        js_path = self.allworking / f"{name}_latest.json"
+        js_path.write_text(json.dumps(configs, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        snap = self.allworking / f"{name}_{ts}.json"
+        try:
+            shutil.copyfile(js_path, snap)
+        except Exception:
+            snap.write_text(json.dumps(configs), encoding="utf-8")
+        return {"txt": txt_path, "json": js_path, "snap": snap}
+
+    def write_stable(self, cache, proxies, stable_cfg=None, new_cfg=None):
+        return self._write_cluster_bundle("stable", cache, proxies, "stable",
+                                          stable_cfg, new_cfg)
+
+    def write_new(self, cache, proxies, stable_cfg=None, new_cfg=None):
+        return self._write_cluster_bundle("new", cache, proxies, "new",
+                                          stable_cfg, new_cfg)
 
     def write_sub_logs(self, sub_index, working_now, unworking_now):
         d = self.logs / str(sub_index)
@@ -1788,16 +1916,19 @@ class OutputWriter:
                 ex.add(u)
         path.write_text("\n".join(sorted(ex)) + "\n" if ex else "", encoding="utf-8")
 
-def _named_lines(cache, proxies):
+def _named_lines(cache, proxies, stable_cfg=None, new_cfg=None):
     lines = []
     for i, p in enumerate(proxies, 1):
         it = cache.items.get(p.dedup_key(), {})
         flag = resolve_flag(it)
-        lines.append(dump_to_uri(p, override_name=f"{flag}{i}| @XelaraVpn"))
+        cluster = cache.classify(it, stable_cfg, new_cfg)
+        mark = marker_for(cluster, stable_cfg, new_cfg)
+        prefix = f"{mark} " if mark else ""
+        lines.append(dump_to_uri(p, override_name=f"{prefix}{flag}{i}| @XelaraVpn"))
     return lines
 
 # ============================================================================
-# Параллельная проверка — v-dbl + v-speed
+# Параллельная проверка
 # ============================================================================
 def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     concurrency, server_timeout=SERVER_TIMEOUT_DEFAULT,
@@ -1805,10 +1936,6 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     min_down=0.05, min_up=0.02, require_upload=True,
                     double_check=True, discard_failed=True,
                     discard_log=DISCARD_FILE):
-    """
-    v-dbl: двойная проверка.
-    v-speed: реальный замер скорости (↓ / ↑) перед пометкой working.
-    """
     results = {}
 
     if double_check and discard_failed and discard_log:
@@ -1917,32 +2044,49 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
 # ============================================================================
 # Финальная запись
 # ============================================================================
-def _write_final(cache, writer, sources_count, final_file="working.txt"):
+def _write_final(cache, writer, sources_count, final_file="working.txt",
+                 stable_cfg=None, new_cfg=None):
     print(f"\n[i] кэш сохранён: {len(cache.items)} записей")
+
+    stable_proxies = []
+    if stable_cfg and stable_cfg.get("enabled", True):
+        stable_proxies = cache.stable_all(
+            min_checks=stable_cfg["min_checks"],
+            min_rate=stable_cfg["min_rate"],
+            min_consecutive=stable_cfg["min_consecutive"],
+            recent_hours=stable_cfg["recent_hours"])
+    stable_keys = {p.dedup_key() for p in stable_proxies}
+
+    new_proxies = []
+    if new_cfg and new_cfg.get("enabled", True):
+        new_proxies = [p for p in cache.new_all(recent_hours=new_cfg["recent_hours"])
+                       if p.dedup_key() not in stable_keys]
 
     by_first = cache.working_by_first_sub()
     for sub_index in range(1, sources_count + 1):
         working = by_first.get(sub_index, [])
-        lines = _named_lines(cache, working)
+        lines = _named_lines(cache, working, stable_cfg, new_cfg)
         writer.write_working_for_sub(sub_index, lines)
 
     all_working = cache.working_all()
-    lines_all = _named_lines(cache, all_working)
+    lines_all = _named_lines(cache, all_working, stable_cfg, new_cfg)
     writer.write_working_all(lines_all)
-    print(f"[i] Working/all.txt: {len(all_working)} рабочих")
+    print(f"[i] Working/all.txt: {len(all_working)} рабочих "
+          f"(⚡ stable: {len(stable_proxies)}, 🟢 new: {len(new_proxies)})")
 
-    # Отчёт по скоростям
     speed_lines = []
     for v in cache.items.values():
         if v.get("status") != "working":
             continue
-        dn = v.get("download_mbps")
-        up = v.get("upload_mbps")
+        dn = v.get("download_mbps"); up = v.get("upload_mbps")
         if dn is None and up is None:
             continue
         p = cache.to_proxy(v)
-        lat = v.get("latency")
-        speed_lines.append(f"↓{dn}Mbps\t↑{up}Mbps\t{lat}ms\t{dump_to_uri(p)}")
+        cluster = cache.classify(v, stable_cfg, new_cfg)
+        mark = marker_for(cluster, stable_cfg, new_cfg)
+        pref = f"{mark} " if mark else ""
+        speed_lines.append(
+            f"{pref}↓{dn}Mbps\t↑{up}Mbps\t{v.get('latency')}ms\t{dump_to_uri(p)}")
     if speed_lines:
         writer.write_speeds(speed_lines)
         print(f"[i] AllWorking/speeds.txt: {len(speed_lines)} строк")
@@ -1955,11 +2099,28 @@ def _write_final(cache, writer, sources_count, final_file="working.txt"):
     print(f"[i] AllWorking/{snap_txt.name} ({len(all_working)} рабочих)")
 
     try:
-        latest_json, snap_json = writer.write_latest_json(cache)
+        latest_json, snap_json = writer.write_latest_json(cache, stable_cfg, new_cfg)
         print(f"[i] AllWorking/{latest_json.name}")
         print(f"[i] AllWorking/{snap_json.name}")
     except Exception as e:
         print(f"[!] latest.json ошибка: {e}")
+
+    if stable_proxies:
+        try:
+            paths = writer.write_stable(cache, stable_proxies, stable_cfg, new_cfg)
+            print(f"[i] AllWorking/{paths['txt'].name}: {len(stable_proxies)} ⚡")
+            print(f"[i] AllWorking/{paths['json'].name}")
+            print(f"[i] AllWorking/{paths['snap'].name}")
+        except Exception as e:
+            print(f"[!] stable ошибка: {e}")
+
+    if new_proxies and new_cfg and new_cfg.get("output", True):
+        try:
+            paths = writer.write_new(cache, new_proxies, stable_cfg, new_cfg)
+            print(f"[i] AllWorking/{paths['txt'].name}: {len(new_proxies)} 🟢")
+            print(f"[i] AllWorking/{paths['json'].name}")
+        except Exception as e:
+            print(f"[!] new ошибка: {e}")
 
     try:
         Path(final_file).write_text(
@@ -1970,7 +2131,7 @@ def _write_final(cache, writer, sources_count, final_file="working.txt"):
         print(f"[!] не удалось записать {final_file}: {e}")
 
 # ============================================================================
-# Объединённый main
+# main
 # ============================================================================
 def _collect_proxies_from_uris(uris):
     out = []
@@ -1985,46 +2146,43 @@ def _collect_proxies_from_uris(uris):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Combined Source Loader + Xray Checker (double-check + speed)")
-    ap.add_argument("--no-load", action="store_true",
-                    help="не скачивать sources.txt (только проверять уже собранное)")
-    ap.add_argument("-i", "--input", default=CONFIGS_FILE,
-                    help="файл с конфигами (по умолчанию configs.txt)")
+        description="Combined Source Loader + Xray Checker (double-check + speed + stable/new)")
+    ap.add_argument("--no-load", action="store_true")
+    ap.add_argument("-i", "--input", default=CONFIGS_FILE)
     ap.add_argument("-o", "--output-dir", default="output")
     ap.add_argument("--cache", default="cache.json")
     ap.add_argument("-c", "--concurrency", type=int, default=16)
     ap.add_argument("--timeout", type=float, default=8.0)
-    ap.add_argument("--server-timeout", type=float, default=6.0,
-                    help="макс. секунд на один сервер, весь цикл (default: 6)")
+    ap.add_argument("--server-timeout", type=float, default=6.0)
     ap.add_argument("--wifi-iface", default=None)
     ap.add_argument("--mobile-iface", default=None)
     ap.add_argument("--xray-dir", default="xray_bin")
     ap.add_argument("--final-file", default="working.txt")
     ap.add_argument("--recheck-files",
-                    default="working.txt,output/AllWorking/latest.txt,output/AllWorking/latest.json",
-                    help="файлы для перепроверки (через запятую)")
-    ap.add_argument("--no-recheck-final", action="store_true",
-                    help="не перепроверять файлы из --recheck-files")
+                    default="working.txt,output/AllWorking/latest.txt,output/AllWorking/latest.json")
+    ap.add_argument("--no-recheck-final", action="store_true")
 
-    ap.add_argument("--no-double-check", action="store_true",
-                    help="не перепроверять серверы, которые не ответили с первого раза")
-    ap.add_argument("--keep-failed", action="store_true",
-                    help="оставлять в кэше серверы, которые не ответили и после второй проверки "
-                         "(попадут в UnWorking/all.txt). По умолчанию они выбрасываются.")
-    ap.add_argument("--discard-log", default=DISCARD_FILE,
-                    help=f"лог выброшенных серверов (default: {DISCARD_FILE})")
+    ap.add_argument("--no-double-check", action="store_true")
+    ap.add_argument("--keep-failed", action="store_true")
+    ap.add_argument("--discard-log", default=DISCARD_FILE)
 
-    # --- Speed test ---
-    ap.add_argument("--no-speed", action="store_true",
-                    help="не замерять скорость скачивания/отдачи (старое поведение)")
-    ap.add_argument("--speed-timeout", type=float, default=5.0,
-                    help="таймаут одного замера скорости, сек (default: 5)")
-    ap.add_argument("--min-down", type=float, default=0.05,
-                    help="мин. скорость скачивания, Mbps (default: 0.05)")
-    ap.add_argument("--min-up", type=float, default=0.02,
-                    help="мин. скорость отдачи, Mbps (default: 0.02)")
-    ap.add_argument("--no-upload-check", action="store_true",
-                    help="проверять только скачивание, отдачу не требовать")
+    ap.add_argument("--no-speed", action="store_true")
+    ap.add_argument("--speed-timeout", type=float, default=5.0)
+    ap.add_argument("--min-down", type=float, default=0.05)
+    ap.add_argument("--min-up", type=float, default=0.02)
+    ap.add_argument("--no-upload-check", action="store_true")
+
+    ap.add_argument("--no-stable", action="store_true")
+    ap.add_argument("--stable-min-checks", type=int, default=3)
+    ap.add_argument("--stable-min-rate", type=float, default=0.8)
+    ap.add_argument("--stable-min-consecutive", type=int, default=2)
+    ap.add_argument("--stable-recent-hours", type=float, default=72.0)
+    ap.add_argument("--stable-marker", default="⚡")
+
+    ap.add_argument("--no-new-marker", action="store_true")
+    ap.add_argument("--new-marker", default="🟢")
+    ap.add_argument("--new-recent-hours", type=float, default=24.0)
+    ap.add_argument("--no-new-output", action="store_true")
 
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
@@ -2045,6 +2203,21 @@ def main():
         discard_failed=not args.keep_failed,
         discard_log=args.discard_log,
     )
+
+    stable_cfg = {
+        "enabled": not args.no_stable,
+        "min_checks": args.stable_min_checks,
+        "min_rate": args.stable_min_rate,
+        "min_consecutive": args.stable_min_consecutive,
+        "recent_hours": args.stable_recent_hours,
+        "marker": args.stable_marker,
+    }
+    new_cfg = {
+        "enabled": not args.no_new_marker,
+        "recent_hours": args.new_recent_hours,
+        "marker": args.new_marker,
+        "output": not args.no_new_output,
+    }
 
     cache = Cache(Path(args.cache))
     writer = OutputWriter(Path(args.output_dir))
@@ -2074,9 +2247,11 @@ def main():
           f"| выбрасывать после 2 фейлов: {'ДА' if check_kwargs['discard_failed'] else 'НЕТ'}")
     print(f"[i] скорость: {'ВКЛ' if check_kwargs['speed_test'] else 'ВЫКЛ'} "
           f"(↓{args.min_down} / ↑{args.min_up} Mbps, таймаут {args.speed_timeout}s)")
-    print(f"[i] в кэше: {len(cache.items)} записей "
-          f"(working={sum(1 for v in cache.items.values() if v.get('status')=='working')}, "
-          f"unworking={sum(1 for v in cache.items.values() if v.get('status')=='unworking')})")
+    print(f"[i] стабильные: {'ВКЛ' if stable_cfg['enabled'] else 'ВЫКЛ'} "
+          f"(метка {stable_cfg['marker']})")
+    print(f"[i] новые: {'ВКЛ' if new_cfg['enabled'] else 'ВЫКЛ'} "
+          f"(метка {new_cfg['marker']}, first_seen<{new_cfg['recent_hours']}ч)")
+    print(f"[i] в кэше: {len(cache.items)} записей")
 
     xray = XrayManager(args.xray_dir)
     xray.ensure()
@@ -2129,20 +2304,21 @@ def main():
                             sub_index=0, concurrency=args.concurrency,
                             **check_kwargs)
         cache.save()
-        _write_final(cache, writer, 0, args.final_file)
+        _write_final(cache, writer, 0, args.final_file,
+                     stable_cfg=stable_cfg, new_cfg=new_cfg)
         return
 
     if args.only_new:
         known = set(cache.items.keys())
         new_only = [p for p in proxies if p.dedup_key() not in known]
-        print(f"[i] only-new: всего {len(proxies)}, новых {len(new_only)} "
-              f"(старых {len(proxies)-len(new_only)})")
+        print(f"[i] only-new: всего {len(proxies)}, новых {len(new_only)}")
         if new_only:
             _check_parallel(new_only, xray, args.timeout, ifaces, cache,
                             sub_index=1, concurrency=args.concurrency,
                             **check_kwargs)
         cache.save()
-        _write_final(cache, writer, len(sources) or 1, args.final_file)
+        _write_final(cache, writer, len(sources) or 1, args.final_file,
+                     stable_cfg=stable_cfg, new_cfg=new_cfg)
         return
 
     uniq = _dedup(proxies)
@@ -2169,7 +2345,8 @@ def main():
         writer.write_sub_logs(999, _dedup(sub_w), _dedup(sub_u))
 
     cache.save()
-    _write_final(cache, writer, max(len(sources), 1), args.final_file)
+    _write_final(cache, writer, max(len(sources), 1), args.final_file,
+                 stable_cfg=stable_cfg, new_cfg=new_cfg)
 
 if __name__ == "__main__":
     try:
