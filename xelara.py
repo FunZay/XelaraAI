@@ -6,6 +6,8 @@ v-dbl + v-speed + v-stable + v-new
   ⚡ = стабильный (>=3 успехов, >=80% rate, >=2 подряд, работал за 72ч)
   🟢 = новый (first_seen не старше 24ч)
   без метки = обычный
+Стабильные и новые НИКОГДА не попадают в один конфиг:
+latest.json содержит отдельный конфиг на каждую пару (страна, кластер).
 Отдельные выводы: stable.txt / stable_latest.json, new.txt / new_latest.json
 """
 
@@ -1234,8 +1236,14 @@ class Cache:
                 and v.get("params", {}).get("server")]
 
     def classify(self, item, stable_cfg=None, new_cfg=None):
+        """🟢 приоритетнее ⚡: сервер, впервые попавший в подписку в окне new,
+        не может быть помечен как стабильный. Так «новый» и «стабильный»
+        взаимоисключающи и не могут оказаться в одном конфиге."""
         if not item:
             return "regular"
+        if (new_cfg and new_cfg.get("enabled", True)
+                and self.is_new(item, recent_hours=new_cfg.get("recent_hours", 24))):
+            return "new"
         if (stable_cfg and stable_cfg.get("enabled", True)
                 and self.is_stable(item,
                     min_checks=stable_cfg.get("min_checks", 3),
@@ -1243,9 +1251,6 @@ class Cache:
                     min_consecutive=stable_cfg.get("min_consecutive", 2),
                     recent_hours=stable_cfg.get("recent_hours", 72))):
             return "stable"
-        if (new_cfg and new_cfg.get("enabled", True)
-                and self.is_new(item, recent_hours=new_cfg.get("recent_hours", 24))):
-            return "new"
         return "regular"
 
 # ============================================================================
@@ -1814,37 +1819,30 @@ class OutputWriter:
         return snap, latest
 
     def write_latest_json(self, cache, stable_cfg=None, new_cfg=None):
-        by_country = defaultdict(list)
+        # Группируем по (страна, кластер). stable и new НИКОГДА не попадут
+        # в один конфиг: у каждого свой балансировщик и своя метка.
+        order = {"stable": 0, "new": 1, "regular": 2}
+        groups = defaultdict(list)
         for v in cache.items.values():
             if v.get("status") != "working":
                 continue
             if not (v.get("params") or {}).get("server"):
                 continue
             cc = v.get("country_code") or ""
-            p = cache.to_proxy(v)
             cluster = cache.classify(v, stable_cfg, new_cfg)
-            by_country[cc].append((p, {"latency": v.get("latency")}, cluster))
+            groups[(cc, cluster)].append(
+                (cache.to_proxy(v), {"latency": v.get("latency")}))
 
         configs = []
-        for cc in sorted(by_country.keys()):
-            cn_ru = country_ru(cc)
-            rows = by_country[cc]
-            clusters = [c for _, _, c in rows]
-            if "stable" in clusters:
-                country_cluster = "stable"
-            elif clusters and all(c == "new" for c in clusters):
-                country_cluster = "new"
-            else:
-                country_cluster = "regular"
-            cfg = _build_country_config(cc, cn_ru, [(p, r) for p, r, _ in rows],
-                                        cluster=country_cluster,
-                                        stable_cfg=stable_cfg, new_cfg=new_cfg)
-            cfg["_counts"] = {
-                "stable":  clusters.count("stable"),
-                "new":     clusters.count("new"),
-                "regular": clusters.count("regular"),
-                "total":   len(clusters),
-            }
+        for cc, cluster in sorted(groups.keys(),
+                                  key=lambda k: (k[0], order.get(k[1], 3))):
+            rows = groups[(cc, cluster)]
+            if not rows:
+                continue
+            cfg = _build_country_config(
+                cc, country_ru(cc), rows,
+                cluster=cluster, stable_cfg=stable_cfg, new_cfg=new_cfg)
+            cfg["_counts"] = {"cluster": cluster, "total": len(rows)}
             configs.append(cfg)
 
         latest = self.allworking / "latest.json"
@@ -2048,19 +2046,27 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
                  stable_cfg=None, new_cfg=None):
     print(f"\n[i] кэш сохранён: {len(cache.items)} записей")
 
-    stable_proxies = []
-    if stable_cfg and stable_cfg.get("enabled", True):
-        stable_proxies = cache.stable_all(
-            min_checks=stable_cfg["min_checks"],
-            min_rate=stable_cfg["min_rate"],
-            min_consecutive=stable_cfg["min_consecutive"],
-            recent_hours=stable_cfg["recent_hours"])
-    stable_keys = {p.dedup_key() for p in stable_proxies}
+    # Сначала определяем «новые» — они приоритетнее ⚡.
+    # Стабильные = стабильные И НЕ новые, поэтому stable.txt и new.txt
+    # никогда не пересекаются, и ⚡ не смешивается с 🟢 в одном конфиге.
+    new_window = (new_cfg.get("recent_hours", 24.0)
+                  if new_cfg and new_cfg.get("enabled", True) else None)
 
     new_proxies = []
-    if new_cfg and new_cfg.get("enabled", True):
-        new_proxies = [p for p in cache.new_all(recent_hours=new_cfg["recent_hours"])
-                       if p.dedup_key() not in stable_keys]
+    if new_window is not None:
+        new_proxies = cache.new_all(recent_hours=new_window)
+    new_keys = {p.dedup_key() for p in new_proxies}
+
+    stable_proxies = []
+    if stable_cfg and stable_cfg.get("enabled", True):
+        stable_proxies = [
+            p for p in cache.stable_all(
+                min_checks=stable_cfg["min_checks"],
+                min_rate=stable_cfg["min_rate"],
+                min_consecutive=stable_cfg["min_consecutive"],
+                recent_hours=stable_cfg["recent_hours"])
+            if new_window is None or p.dedup_key() not in new_keys
+        ]
 
     by_first = cache.working_by_first_sub()
     for sub_index in range(1, sources_count + 1):
