@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 */3 * * *'
   workflow_dispatch:
+    inputs:
+      only_new:
+        description: 'Только новые серверы (--only-new)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -11,7 +16,7 @@ permissions:
 jobs:
   check-and-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
     env:
       PYTHONUNBUFFERED: "1"
 
@@ -48,9 +53,30 @@ jobs:
           fi
           ./xray_bin/xray version
 
-      - name: 🚀 Run Xelara Checker
+      - name: 🚀 Run Xelara Checker (all)
+        if: ${{ github.event.inputs.only_new != 'true' }}
         run: |
-          python xelara.py -c 32 --timeout 10 --server-timeout 12
+          python xelara.py \
+            -c 128 \
+            --timeout 10 \
+            --server-timeout 10 \
+            --max-batch 10000 \
+            --no-double-check \
+            --no-speed \
+            --no-upload-check
+
+      - name: 🚀 Run Xelara Checker (only-new)
+        if: ${{ github.event.inputs.only_new == 'true' }}
+        run: |
+          python xelara.py \
+            --only-new \
+            -c 128 \
+            --timeout 10 \
+            --server-timeout 10 \
+            --max-batch 10000 \
+            --no-double-check \
+            --no-speed \
+            --no-upload-check
 
       - name: 💾 Commit and Push Results
         uses: stefanzweifel/git-auto-commit-action@v5
