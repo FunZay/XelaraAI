@@ -79,9 +79,6 @@ try:
 except Exception:
     pass
 
-# ============================================================================
-# Константы
-# ============================================================================
 SOURCES_FILE     = "sources.txt"
 CONFIGS_FILE     = "configs.txt"
 MY_CONFIGS_FILE  = "my_configs.txt"
@@ -132,9 +129,6 @@ def marker_for(cluster, stable_cfg=None, new_cfg=None):
         return (new_cfg or {}).get("marker", STATUS_MARKERS["new"])
     return ""
 
-# ============================================================================
-# Регулярки
-# ============================================================================
 VLESS_REGEX   = re.compile(r"vless://[^\s#]+", re.IGNORECASE)
 TROJAN_REGEX  = re.compile(r"trojan://[^\s#]+", re.IGNORECASE)
 HY2_REGEX     = re.compile(r"(?:hysteria2|hy2)://[^\s#]+", re.IGNORECASE)
@@ -143,9 +137,6 @@ BASE64_REGEX  = re.compile(r'^[A-Za-z0-9+/]+=*$', re.MULTILINE)
 UUID_REGEX    = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 URI_REGEX     = re.compile(r"(?:vless|vmess|trojan|ss)://[^\s\"'<>]+")
 
-# ============================================================================
-# Страны
-# ============================================================================
 COUNTRY_RU = {
     "RU": "Россия", "DE": "Германия", "NL": "Нидерланды", "SE": "Швеция",
     "FR": "Франция", "GB": "Великобритания", "UK": "Великобритания",
@@ -181,9 +172,6 @@ def country_ru(cc, fallback=""):
         return fallback or cc
     return "Европа"
 
-# ============================================================================
-# Утилиты
-# ============================================================================
 def clean_text(text: str) -> str:
     if not text:
         return ""
@@ -202,6 +190,14 @@ def _safe_int(v, default=0):
         return int(v)
     except (TypeError, ValueError):
         return default
+
+def _safe_urlparse(uri):
+    """urlparse, который возвращает None вместо ValueError на кривых URL.
+    Главный фикс #196: ValueError('Invalid IPv6 URL') не должен ронять весь прогон."""
+    try:
+        return urlparse(uri)
+    except ValueError:
+        return None
 
 def flag_from_cc(cc):
     if not cc or len(cc) != 2:
@@ -228,9 +224,6 @@ def _extra_hash(ex):
     except Exception:
         return ""
 
-# ============================================================================
-# Скорость
-# ============================================================================
 def _measure_download_speed(session, timeout):
     for url in SPEED_DOWN_URLS:
         t0 = time.perf_counter()
@@ -268,9 +261,6 @@ def _measure_upload_speed(session, timeout):
             continue
     return None
 
-# ============================================================================
-# Конвертеры JSON/YAML → URI
-# ============================================================================
 def safe_quote(s: str) -> str:
     return urllib.parse.quote(s, safe='')
 
@@ -607,11 +597,10 @@ def extract_configs_from_text(text: str):
 
     return vless_list, trojan_list, hy2_list, base64_count, json_count, yaml_count
 
-# ============================================================================
-# Happ-фолбэк
-# ============================================================================
 def fetch_with_happ_method(url: str) -> Optional[str]:
-    parsed = urllib.parse.urlparse(url)
+    parsed = _safe_urlparse(url)
+    if parsed is None:
+        return None
     if 'hwid=' not in url:
         separator = '&' if parsed.query else '?'
         url_with_hwid = f"{url}{separator}hwid={HWID_STATIC}"
@@ -641,9 +630,6 @@ def fetch_with_happ_method(url: str) -> Optional[str]:
                 continue
     return None
 
-# ============================================================================
-# Загрузка источников
-# ============================================================================
 async def process_source(session, url, sem, stats, stats_lock):
     async with sem:
         content = None
@@ -794,9 +780,6 @@ async def load_http_sources():
 
     return stats['all_configs'], my_configs, stats
 
-# ============================================================================
-# Proxy + парсер URI
-# ============================================================================
 @dataclass
 class Proxy:
     raw: str = ""
@@ -845,8 +828,8 @@ def _p_vmess(uri):
     })
 
 def _p_vless(uri):
-    u = urlparse(uri)
-    if not u.hostname:
+    u = _safe_urlparse(uri)
+    if u is None or not u.hostname:
         return None
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     extra = {}
@@ -873,8 +856,8 @@ def _p_vless(uri):
                  })
 
 def _p_trojan(uri):
-    u = urlparse(uri)
-    if not u.hostname:
+    u = _safe_urlparse(uri)
+    if u is None or not u.hostname:
         return None
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     return Proxy(raw=uri, kind="trojan",
@@ -918,12 +901,17 @@ _P = {"vmess://": _p_vmess, "vless://": _p_vless,
       "trojan://": _p_trojan, "ss://": _p_ss}
 
 def parse_uri(uri):
+    """Главный фикс #196 — любой ValueError в парсере ловится здесь,
+    кривой URI просто пропускается."""
     uri = uri.strip()
     if not uri or uri.startswith("#"):
         return None
     for p, fn in _P.items():
         if uri.startswith(p):
-            return fn(uri)
+            try:
+                return fn(uri)
+            except Exception:
+                return None
     return None
 
 def _extract_uris(text):
@@ -1083,9 +1071,6 @@ def dump_to_uri(pr, override_name=None):
             json.dumps(obj, ensure_ascii=False).encode()).decode()
     return pr.raw or ""
 
-# ============================================================================
-# Cache
-# ============================================================================
 class Cache:
     def __init__(self, path):
         self.path = path
@@ -1236,9 +1221,6 @@ class Cache:
                 and v.get("params", {}).get("server")]
 
     def classify(self, item, stable_cfg=None, new_cfg=None):
-        """🟢 приоритетнее ⚡: сервер, впервые попавший в подписку в окне new,
-        не может быть помечен как стабильный. Так «новый» и «стабильный»
-        взаимоисключающи и не могут оказаться в одном конфиге."""
         if not item:
             return "regular"
         if (new_cfg and new_cfg.get("enabled", True)
@@ -1253,13 +1235,10 @@ class Cache:
             return "stable"
         return "regular"
 
-# ============================================================================
-# Xray Manager
-# ============================================================================
-def _download(url, dest, attempts=3, timeout=60):
+def _download(url, dest, attempts=3, timeout=120):
     for i in range(1, attempts + 1):
         try:
-            with requests.get(url, stream=True, timeout=timeout,
+            with requests.get(url, stream=True, timeout=(15, timeout),
                               headers={"User-Agent": USER_AGENT}) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("Content-Length", 0))
@@ -1271,16 +1250,24 @@ def _download(url, dest, attempts=3, timeout=60):
                         f.write(chunk)
                         got += len(chunk)
                         if total:
-                            print(f"\r    [{i}/{attempts}] {int(got*100/total)}% "
-                                  f"({got//1024}/{total//1024} KiB)", end="")
-                print()
+                            pct = int(got * 100 / total)
+                            print(f"\r    [{i}/{attempts}] {pct}% "
+                                  f"({got//1024}/{total//1024} KiB)",
+                                  end="", flush=True)
+                print(flush=True)
+                if total and got < total:
+                    raise IOError(f"incomplete {got}/{total}")
             return True
         except Exception as e:
-            print(f"\n    [!] попытка {i}/{attempts}: {e}")
+            print(f"\n    [!] попытка {i}/{attempts}: "
+                  f"{type(e).__name__}: {e}", flush=True)
             if dest.exists():
-                dest.unlink(missing_ok=True)
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
             if i < attempts:
-                time.sleep(2)
+                time.sleep(3)
     return False
 
 class XrayManager:
@@ -1312,22 +1299,27 @@ class XrayManager:
         z = self.dir / asset
         ok = False
         for u in urls:
-            print(f"[xray] скачиваю: {u}")
+            print(f"[xray] скачиваю: {u}", flush=True)
             if _download(u, z):
                 ok = True
                 break
         if not ok:
             raise RuntimeError("Xray не скачался")
-        with zipfile.ZipFile(z) as zf:
-            zf.extractall(self.dir)
-        z.unlink(missing_ok=True)
+        try:
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(self.dir)
+        finally:
+            try:
+                z.unlink()
+            except Exception:
+                pass
         if not self.bin.exists():
             for p in self.dir.iterdir():
                 if p.is_file() and p.stem.lower() == "xray":
                     p.rename(self.bin)
                     break
         if not self.bin.exists():
-            raise RuntimeError("xray не найден")
+            raise RuntimeError("xray не найден после распаковки")
         if platform.system() != "Windows":
             self.bin.chmod(self.bin.stat().st_mode | stat.S_IEXEC)
         print(f"[xray] готов: {self.bin}")
@@ -1356,9 +1348,6 @@ def _wait_port(port, timeout=6.0):
             time.sleep(0.05)
     return False
 
-# ============================================================================
-# Checker
-# ============================================================================
 def _get_iface_ip(name):
     try:
         import psutil
@@ -1636,9 +1625,6 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                     pass
         cp.unlink(missing_ok=True)
 
-# ============================================================================
-# Отчёты
-# ============================================================================
 def fetch_url(url, timeout=20):
     try:
         s = requests.Session()
@@ -1776,9 +1762,6 @@ def _build_country_config(cc, cn, servers, cluster="regular",
         },
     }
 
-# ============================================================================
-# OutputWriter
-# ============================================================================
 class OutputWriter:
     def __init__(self, base):
         self.base = base
@@ -1819,8 +1802,6 @@ class OutputWriter:
         return snap, latest
 
     def write_latest_json(self, cache, stable_cfg=None, new_cfg=None):
-        # Группируем по (страна, кластер). stable и new НИКОГДА не попадут
-        # в один конфиг: у каждого свой балансировщик и своя метка.
         order = {"stable": 0, "new": 1, "regular": 2}
         groups = defaultdict(list)
         for v in cache.items.values():
@@ -1925,9 +1906,6 @@ def _named_lines(cache, proxies, stable_cfg=None, new_cfg=None):
         lines.append(dump_to_uri(p, override_name=f"{prefix}{flag}{i}| @XelaraVpn"))
     return lines
 
-# ============================================================================
-# Параллельная проверка
-# ============================================================================
 def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     concurrency, server_timeout=SERVER_TIMEOUT_DEFAULT,
                     speed_test=True, speed_timeout=5.0,
@@ -2039,16 +2017,10 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
 
     return results
 
-# ============================================================================
-# Финальная запись
-# ============================================================================
 def _write_final(cache, writer, sources_count, final_file="working.txt",
                  stable_cfg=None, new_cfg=None):
     print(f"\n[i] кэш сохранён: {len(cache.items)} записей")
 
-    # Сначала определяем «новые» — они приоритетнее ⚡.
-    # Стабильные = стабильные И НЕ новые, поэтому stable.txt и new.txt
-    # никогда не пересекаются, и ⚡ не смешивается с 🟢 в одном конфиге.
     new_window = (new_cfg.get("recent_hours", 24.0)
                   if new_cfg and new_cfg.get("enabled", True) else None)
 
@@ -2136,9 +2108,6 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
     except Exception as e:
         print(f"[!] не удалось записать {final_file}: {e}")
 
-# ============================================================================
-# main
-# ============================================================================
 def _collect_proxies_from_uris(uris):
     out = []
     for u in uris:
@@ -2260,7 +2229,11 @@ def main():
     print(f"[i] в кэше: {len(cache.items)} записей")
 
     xray = XrayManager(args.xray_dir)
-    xray.ensure()
+    try:
+        xray.ensure()
+    except Exception as e:
+        print(f"[!] Xray недоступен: {e}")
+        sys.exit(1)
 
     ifaces = {"default": None}
     if args.wifi_iface:
