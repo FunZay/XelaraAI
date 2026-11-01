@@ -40,6 +40,16 @@ jobs:
           path: xray_bin
           key: xray-${{ runner.os }}-v1
 
+      - name: 📦 Restore Xelara cache (single file OR parts)
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache.json
+            cache_parts
+          key: xelara-cache-${{ github.run_id }}
+          restore-keys: |
+            xelara-cache-
+
       - name: ⬇️ Pre-download Xray (curl, with retry)
         run: |
           mkdir -p xray_bin
@@ -57,32 +67,21 @@ jobs:
         if: ${{ github.event.inputs.only_new != 'true' }}
         run: |
           python xelara.py \
-            -c 128 \
-            --timeout 10 \
-            --server-timeout 10 \
-            --max-batch 10000 \
-            --no-double-check \
-            --no-speed \
-            --no-upload-check
+            -c 32 --timeout 15 --server-timeout 15 --max-batch 10000 \
+            --no-double-check
 
       - name: 🚀 Run Xelara Checker (only-new)
         if: ${{ github.event.inputs.only_new == 'true' }}
         run: |
-          python xelara.py \
-            --only-new \
-            -c 32 \
-            --timeout 15 \
-            --server-timeout 15 \
-            --max-batch 10000 \
-            --no-double-check \
-            --no-speed \
-            --no-upload-check
+          python xelara.py --only-new \
+            -c 32 --timeout 10 --server-timeout 10 --max-batch 10000 \
+            --no-double-check --no-speed --no-upload-check
 
       - name: 💾 Commit and Push Results
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "🤖 Auto-update configs [skip ci]"
-          file_pattern: "output/AllWorking/latest.json output/AllWorking/latest.txt working.txt cache.json"
+          file_pattern: "output/AllWorking/latest.json output/AllWorking/latest.txt working.txt sources.txt blacklist_sources.txt"
           commit_user_name: "Xelara Bot"
           commit_user_email: "bot@xelara.local"
 
