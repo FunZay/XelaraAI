@@ -2,17 +2,18 @@ name: Xelara Auto-Check & Sync
 
 on:
   schedule:
-    # Запуск каждые 3 часа (в 00:00, 03:00, 06:00 и т.д. по UTC)
     - cron: '0 */3 * * *'
-  workflow_dispatch: # Позволяет запустить вручную кнопкой в GitHub
+  workflow_dispatch:
 
 permissions:
-  contents: write # Нужно, чтобы бот мог коммитить обновленный latest.json
+  contents: write
 
 jobs:
   check-and-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 120 # Если проверка зависнет, GitHub ее прибьет
+    timeout-minutes: 120
+    env:
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: 📥 Checkout repository
@@ -22,41 +23,52 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # Убрали cache: 'pip', так как нет requirements.txt
 
       - name: 📦 Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Базовые зависимости для xelara.py
           pip install requests PySocks psutil aiohttp aiofiles PyYAML
 
+      - name: 📦 Cache Xray binary
+        uses: actions/cache@v4
+        with:
+          path: xray_bin
+          key: xray-${{ runner.os }}-v1
+
+      - name: ⬇️ Pre-download Xray (curl, with retry)
+        run: |
+          mkdir -p xray_bin
+          if [ ! -x xray_bin/xray ]; then
+            curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+                 --connect-timeout 20 --max-time 300 \
+                 -o /tmp/xray.zip \
+                 https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+            unzip -o /tmp/xray.zip -d xray_bin
+            chmod +x xray_bin/xray
+          fi
+          ./xray_bin/xray version
+
       - name: 🚀 Run Xelara Checker
-        # Скрипт находится в корне репозитория
         run: |
           python xelara.py -c 32 --timeout 10 --server-timeout 12
-        
+
       - name: 💾 Commit and Push Results
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "🤖 Auto-update configs [skip ci]"
-          # Коммитим файлы из корня репозитория
           file_pattern: "output/AllWorking/latest.json output/AllWorking/latest.txt working.txt cache.json"
           commit_user_name: "Xelara Bot"
           commit_user_email: "bot@xelara.local"
 
       - name: 🔄 Trigger Worker Sync
-        # Дергаем API вашего воркера, чтобы он обновил БД
         env:
-          # Мы жестко зашиваем ваш URL из сообщения
           WORKER_URL: "https://adminvpn.xelaravpn.workers.dev"
-          # ADMIN_TOKEN нужно добавить в Secrets вашего репозитория
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
           if [ -z "$ADMIN_TOKEN" ]; then
             echo "⚠️ Пропускаю синхронизацию воркера, так как секрет ADMIN_TOKEN не задан."
             exit 0
           fi
-          
           echo "Стучусь в воркер: $WORKER_URL/api/admin/sync"
           curl -X POST "$WORKER_URL/api/admin/sync" \
             -H "X-Token: $ADMIN_TOKEN" \
