@@ -6,9 +6,9 @@ v-dbl + v-speed + v-stable + v-new
   ⚡ = стабильный (>=3 успехов, >=80% rate, >=2 подряд, работал за 72ч)
   🟢 = новый (first_seen не старше 24ч)
   без метки = обычный
-Стабильные и новые НИКОГДА не попадают в один конфиг:
-latest.json содержит отдельный конфиг на каждую пару (страна, кластер).
-Отдельные выводы: stable.txt / stable_latest.json, new.txt / new_latest.json
+Стабильные и новые НИКОГДА не попадают в один конфиг.
+Батчинг: проверка идёт порциями по MAX_BATCH_SIZE (по умолчанию 10k).
+Кэш сохраняется после каждого батча — при падении прогресс не теряется.
 """
 
 import importlib, subprocess, sys
@@ -88,6 +88,9 @@ DISCARD_FILE     = "discarded.txt"
 THREADS         = 50
 TIMEOUT_NORMAL  = 5
 TIMEOUT_HAPP    = 5
+
+MAX_BATCH_SIZE  = 10_000
+MAX_CONCURRENCY = 256
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 combined/1.0")
@@ -192,8 +195,6 @@ def _safe_int(v, default=0):
         return default
 
 def _safe_urlparse(uri):
-    """urlparse, который возвращает None вместо ValueError на кривых URL.
-    Главный фикс #196: ValueError('Invalid IPv6 URL') не должен ронять весь прогон."""
     try:
         return urlparse(uri)
     except ValueError:
@@ -901,8 +902,6 @@ _P = {"vmess://": _p_vmess, "vless://": _p_vless,
       "trojan://": _p_trojan, "ss://": _p_ss}
 
 def parse_uri(uri):
-    """Главный фикс #196 — любой ValueError в парсере ловится здесь,
-    кривой URI просто пропускается."""
     uri = uri.strip()
     if not uri or uri.startswith("#"):
         return None
@@ -1911,8 +1910,9 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     speed_test=True, speed_timeout=5.0,
                     min_down=0.05, min_up=0.02, require_upload=True,
                     double_check=True, discard_failed=True,
-                    discard_log=DISCARD_FILE):
-    results = {}
+                    discard_log=DISCARD_FILE,
+                    max_batch=MAX_BATCH_SIZE):
+    results = {k: [] for k in ifaces}
 
     if double_check and discard_failed and discard_log:
         try:
@@ -1920,100 +1920,134 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
         except Exception:
             pass
 
-    for iface_key, iface_name in ifaces.items():
-        send_through = None
-        if iface_name:
-            send_through = _get_iface_ip(iface_name)
-            if not send_through:
-                print(f"[!] интерфейс '{iface_name}' не найден — пропускаю")
-                continue
+    total = len(proxies)
+    if total == 0:
+        return results
 
-        def _run_batch(batch, pass_label):
-            if not batch:
-                return []
-            pairs = []
-            lock = threading.Lock()
-            done = [0]
-            total = len(batch)
-            print_lock = threading.Lock()
+    n_batches = (total + max_batch - 1) // max_batch
+    if n_batches > 1:
+        print(f"\n[i] {total} серверов разбиты на {n_batches} батчей "
+              f"по ≤ {max_batch}")
+    t_all_start = time.time()
 
-            def _w(pr):
-                prior = ""
-                it = cache.items.get(pr.dedup_key(), {})
-                if it and it.get("country_code"):
-                    prior = it["country_code"]
-                r = check_proxy(pr, xray, timeout, send_through,
-                                prior_cc=prior, server_timeout=server_timeout,
-                                speed_test=speed_test, speed_timeout=speed_timeout,
-                                min_down=min_down, min_up=min_up,
-                                require_upload=require_upload)
-                cache.upsert(pr, r, sub_index)
-                with lock:
-                    pairs.append((pr, r))
-                    done[0] += 1
-                    n = done[0]
-                label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
-                with print_lock:
-                    dn = r.get("download_mbps")
-                    up = r.get("upload_mbps")
-                    sp_s = ""
-                    if dn is not None or up is not None:
-                        sp_s = (f" ↓{dn if dn is not None else '—'}Mbps "
-                                f"↑{up if up is not None else '—'}Mbps")
-                    if r["ok"]:
-                        flag = flag_from_cc(r.get("country_code", ""))
-                        cn = country_ru(r.get("country_code", ""))
-                        ka = r.get("latency_keepalive")
-                        ka_s = f"ka={ka}ms" if ka is not None else "ka=—"
-                        el = r.get("elapsed")
-                        el_s = f" {el}s" if el is not None else ""
-                        print(f"  {pass_label} [{n}/{total}] OK {flag} {cn} {r['latency']}ms "
-                              f"{ka_s}{sp_s}{el_s} ip={r['ip']} | {label}")
+    for batch_idx in range(n_batches):
+        start = batch_idx * max_batch
+        end   = min(start + max_batch, total)
+        batch = proxies[start:end]
+        t_batch_start = time.time()
+
+        if n_batches > 1:
+            print(f"\n{'═'*70}")
+            print(f"[i] БАТЧ {batch_idx + 1}/{n_batches} "
+                  f"— серверы {start + 1}…{end} из {total}")
+            print(f"{'═'*70}")
+
+        for iface_key, iface_name in ifaces.items():
+            send_through = None
+            if iface_name:
+                send_through = _get_iface_ip(iface_name)
+                if not send_through:
+                    print(f"[!] интерфейс '{iface_name}' не найден — пропускаю")
+                    continue
+
+            def _run_batch(sub_batch, pass_label):
+                if not sub_batch:
+                    return []
+                pairs = []
+                lock = threading.Lock()
+                done = [0]
+                tot = len(sub_batch)
+                print_lock = threading.Lock()
+
+                def _w(pr):
+                    prior = ""
+                    it = cache.items.get(pr.dedup_key(), {})
+                    if it and it.get("country_code"):
+                        prior = it["country_code"]
+                    r = check_proxy(pr, xray, timeout, send_through,
+                                    prior_cc=prior, server_timeout=server_timeout,
+                                    speed_test=speed_test, speed_timeout=speed_timeout,
+                                    min_down=min_down, min_up=min_up,
+                                    require_upload=require_upload)
+                    cache.upsert(pr, r, sub_index)
+                    with lock:
+                        pairs.append((pr, r))
+                        done[0] += 1
+                        n = done[0]
+                    label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
+                    with print_lock:
+                        dn = r.get("download_mbps")
+                        up = r.get("upload_mbps")
+                        sp_s = ""
+                        if dn is not None or up is not None:
+                            sp_s = (f" ↓{dn if dn is not None else '—'}Mbps "
+                                    f"↑{up if up is not None else '—'}Mbps")
+                        if r["ok"]:
+                            flag = flag_from_cc(r.get("country_code", ""))
+                            cn = country_ru(r.get("country_code", ""))
+                            ka = r.get("latency_keepalive")
+                            ka_s = f"ka={ka}ms" if ka is not None else "ka=—"
+                            el = r.get("elapsed")
+                            el_s = f" {el}s" if el is not None else ""
+                            print(f"  {pass_label} [{n}/{tot}] OK {flag} {cn} {r['latency']}ms "
+                                  f"{ka_s}{sp_s}{el_s} ip={r['ip']} | {label}")
+                        else:
+                            el = r.get("elapsed")
+                            el_s = f" {el}s" if el is not None else ""
+                            print(f"  {pass_label} [{n}/{tot}] FAIL{sp_s}{el_s} "
+                                  f"{r['error']} | {label}")
+
+                with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
+                    list(ex.map(_w, sub_batch))
+                return pairs
+
+            first_pairs = _run_batch(batch, "1st")
+            final_pairs = [(pr, r) for pr, r in first_pairs if r["ok"]]
+            failed = [pr for pr, r in first_pairs if not r["ok"]]
+
+            if double_check and failed:
+                print(f"\n  ⟳ Двойная проверка: {len(failed)} серверов без ответа, "
+                      f"ставлю в конец очереди...")
+                retry_pairs = _run_batch(failed, "2nd")
+                success_retry = [(pr, r) for pr, r in retry_pairs if r["ok"]]
+                still_failed  = [(pr, r) for pr, r in retry_pairs if not r["ok"]]
+
+                final_pairs.extend(success_retry)
+
+                if still_failed:
+                    print(f"\n  ✗ После второй проверки не ответили: {len(still_failed)}")
+                    if discard_failed:
+                        for pr, r in still_failed:
+                            key = pr.dedup_key()
+                            cache.items.pop(key, None)
+                            label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
+                            err = r.get("error") or "timeout"
+                            print(f"    ✗ выброшен: {label} ({err})")
+                            if discard_log:
+                                try:
+                                    with open(discard_log, "a", encoding="utf-8") as f:
+                                        f.write(f"{pr.raw or label}\t{err}\n")
+                                except Exception:
+                                    pass
                     else:
-                        el = r.get("elapsed")
-                        el_s = f" {el}s" if el is not None else ""
-                        print(f"  {pass_label} [{n}/{total}] FAIL{sp_s}{el_s} {r['error']} | {label}")
-
-            with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
-                list(ex.map(_w, batch))
-            return pairs
-
-        first_pairs = _run_batch(proxies, "1st")
-        final_pairs = [(pr, r) for pr, r in first_pairs if r["ok"]]
-        failed = [pr for pr, r in first_pairs if not r["ok"]]
-
-        if double_check and failed:
-            print(f"\n  ⟳ Двойная проверка: {len(failed)} серверов без ответа, "
-                  f"ставлю в конец очереди...")
-            retry_pairs = _run_batch(failed, "2nd")
-            success_retry = [(pr, r) for pr, r in retry_pairs if r["ok"]]
-            still_failed = [(pr, r) for pr, r in retry_pairs if not r["ok"]]
-
-            final_pairs.extend(success_retry)
-
-            if still_failed:
-                print(f"\n  ✗ После второй проверки не ответили: {len(still_failed)}")
-                if discard_failed:
-                    for pr, r in still_failed:
-                        key = pr.dedup_key()
-                        cache.items.pop(key, None)
-                        label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
-                        err = r.get("error") or "timeout"
-                        print(f"    ✗ выброшен: {label} ({err})")
-                        if discard_log:
-                            try:
-                                with open(discard_log, "a", encoding="utf-8") as f:
-                                    f.write(f"{pr.raw or label}\t{err}\n")
-                            except Exception:
-                                pass
+                        final_pairs.extend(still_failed)
                 else:
-                    final_pairs.extend(still_failed)
-            else:
-                print(f"\n  ✓ После второй проверки восстановились: {len(success_retry)}")
-        elif failed and not double_check:
-            final_pairs.extend([(pr, r) for pr, r in first_pairs if not r["ok"]])
+                    print(f"\n  ✓ После второй проверки восстановились: {len(success_retry)}")
+            elif failed and not double_check:
+                final_pairs.extend([(pr, r) for pr, r in first_pairs if not r["ok"]])
 
-        results[iface_key] = final_pairs
+            results[iface_key].extend(final_pairs)
+
+        if n_batches > 1:
+            try:
+                cache.save()
+                dt_batch = time.time() - t_batch_start
+                dt_all = time.time() - t_all_start
+                eta = (dt_all / (batch_idx + 1)) * (n_batches - batch_idx - 1)
+                print(f"\n[i] батч {batch_idx + 1}/{n_batches} за {dt_batch:.0f}s, "
+                      f"кэш сохранён. ETA ~{eta/60:.0f} мин")
+            except Exception as e:
+                print(f"[!] не удалось сохранить кэш: {e}")
 
     return results
 
@@ -2121,7 +2155,7 @@ def _collect_proxies_from_uris(uris):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Combined Source Loader + Xray Checker (double-check + speed + stable/new)")
+        description="Combined Source Loader + Xray Checker (batched, double-check optional)")
     ap.add_argument("--no-load", action="store_true")
     ap.add_argument("-i", "--input", default=CONFIGS_FILE)
     ap.add_argument("-o", "--output-dir", default="output")
@@ -2159,13 +2193,22 @@ def main():
     ap.add_argument("--new-recent-hours", type=float, default=24.0)
     ap.add_argument("--no-new-output", action="store_true")
 
+    ap.add_argument("--max-batch", type=int, default=MAX_BATCH_SIZE,
+                    help=f"макс. серверов за один батч (default: {MAX_BATCH_SIZE})")
+
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
     mode.add_argument("--only-old", action="store_true")
     args = ap.parse_args()
 
-    if args.concurrency < 1:  args.concurrency = 1
-    if args.concurrency > 64: args.concurrency = 64
+    if args.concurrency < 1:
+        args.concurrency = 1
+    if args.concurrency > MAX_CONCURRENCY:
+        print(f"[!] -c {args.concurrency} слишком много, ставлю {MAX_CONCURRENCY}")
+        args.concurrency = MAX_CONCURRENCY
+    if args.max_batch < 100:
+        print(f"[!] --max-batch={args.max_batch} слишком мало, ставлю 100")
+        args.max_batch = 100
 
     check_kwargs = dict(
         server_timeout=args.server_timeout,
@@ -2177,6 +2220,7 @@ def main():
         double_check=not args.no_double_check,
         discard_failed=not args.keep_failed,
         discard_log=args.discard_log,
+        max_batch=args.max_batch,
     )
 
     stable_cfg = {
@@ -2218,6 +2262,7 @@ def main():
     print(f"\n[i] режим: {'only-new' if args.only_new else 'only-old' if args.only_old else 'all'}")
     print(f"[i] источников (URL): {len(sources)}")
     print(f"[i] параллельно: {args.concurrency} | бюджет на сервер: {args.server_timeout}s")
+    print(f"[i] батч: ≤{args.max_batch} серверов за проход")
     print(f"[i] двойная проверка: {'ВКЛ' if check_kwargs['double_check'] else 'ВЫКЛ'} "
           f"| выбрасывать после 2 фейлов: {'ДА' if check_kwargs['discard_failed'] else 'НЕТ'}")
     print(f"[i] скорость: {'ВКЛ' if check_kwargs['speed_test'] else 'ВЫКЛ'} "
