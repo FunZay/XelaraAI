@@ -70,9 +70,9 @@ jobs:
         run: |
           python xelara.py \
             --only-new \
-            -c 128 \
-            --timeout 10 \
-            --server-timeout 10 \
+            -c 32 \
+            --timeout 15 \
+            --server-timeout 15 \
             --max-batch 10000 \
             --no-double-check \
             --no-speed \
