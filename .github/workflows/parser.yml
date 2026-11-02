@@ -1,50 +1,31 @@
 name: Xelara Auto-Check & Sync
 
 on:
-  schedule:
-    - cron: '0 */3 * * *'
   workflow_dispatch:
     inputs:
       mode:
         description: 'Режим проверки'
         type: choice
         default: 'all'
-        options:
-          - all
-          - only-new
-          - only-old
+        options: [all, only-new, only-old]
 
       concurrency:
         description: 'Параллельных потоков (-c)'
         type: choice
         default: '32'
-        options:
-          - '16'
-          - '32'
-          - '48'
-          - '64'
-          - '96'
+        options: ['16', '32', '48', '64', '96']
 
       timeout:
-        description: 'Таймаут на запрос, сек (--timeout / --server-timeout)'
+        description: 'Таймаут на запрос, сек'
         type: choice
         default: '10'
-        options:
-          - '8'
-          - '10'
-          - '15'
-          - '20'
-          - '30'
+        options: ['8', '10', '15', '20', '30']
 
       max_batch:
-        description: 'Размер батча (--max-batch)'
+        description: 'Размер батча'
         type: choice
         default: '3000'
-        options:
-          - '1000'
-          - '3000'
-          - '5000'
-          - '10000'
+        options: ['1000', '3000', '5000', '10000']
 
       reset_blacklist:
         description: 'Сбросить fail_count у всех серверов'
@@ -134,7 +115,6 @@ jobs:
           IN_WITH_SPEED:        ${{ github.event.inputs.with_speed }}
           IN_DOUBLE_CHECK:      ${{ github.event.inputs.double_check }}
         run: |
-          # Дефолты для cron-запуска (когда inputs пустые)
           MODE="${IN_MODE:-all}"
           CONC="${IN_CONCURRENCY:-32}"
           TMO="${IN_TIMEOUT:-10}"
