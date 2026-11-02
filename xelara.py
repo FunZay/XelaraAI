@@ -2,13 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Combined Source Loader + Xray Parser & Checker
-v-dbl + v-speed + v-stable + v-new
-  ⚡ = стабильный (>=3 успехов, >=80% rate, >=2 подряд, работал за 72ч)
-  🟢 = новый (first_seen не старше 24ч)
-  без метки = обычный
-Стабильные и новые НИКОГДА не попадают в один конфиг.
-Батчинг: проверка идёт порциями по MAX_BATCH_SIZE (по умолчанию 10k).
-Кэш сохраняется после каждого батча — при падении прогресс не теряется.
+v-dbl + v-speed + v-stable + v-new + blacklist + batched + split-cache
 """
 
 import importlib, subprocess, sys
@@ -49,6 +43,7 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import socket
@@ -79,6 +74,9 @@ try:
 except Exception:
     pass
 
+# ============================================================================
+# Константы
+# ============================================================================
 SOURCES_FILE     = "sources.txt"
 CONFIGS_FILE     = "configs.txt"
 MY_CONFIGS_FILE  = "my_configs.txt"
@@ -91,6 +89,11 @@ TIMEOUT_HAPP    = 5
 
 MAX_BATCH_SIZE  = 10_000
 MAX_CONCURRENCY = 256
+
+BLACKLIST_FAIL_THRESHOLD = 3
+
+CACHE_SPLIT_THRESHOLD_MB    = 50
+CACHE_SPLIT_THRESHOLD_BYTES = CACHE_SPLIT_THRESHOLD_MB * 1024 * 1024
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 combined/1.0")
@@ -225,6 +228,9 @@ def _extra_hash(ex):
     except Exception:
         return ""
 
+# ============================================================================
+# Скорость
+# ============================================================================
 def _measure_download_speed(session, timeout):
     for url in SPEED_DOWN_URLS:
         t0 = time.perf_counter()
@@ -262,6 +268,9 @@ def _measure_upload_speed(session, timeout):
             continue
     return None
 
+# ============================================================================
+# Конвертеры JSON/YAML → URI
+# ============================================================================
 def safe_quote(s: str) -> str:
     return urllib.parse.quote(s, safe='')
 
@@ -288,17 +297,14 @@ def is_valid_config(url: str) -> bool:
 def outbound_to_vless_url(out: dict) -> Optional[str]:
     settings = out.get('settings', {})
     vnext = settings.get('vnext', [])
-    if not vnext:
-        return None
+    if not vnext: return None
     first = vnext[0]
     address = first.get('address'); port = first.get('port')
     users = first.get('users', [])
-    if not users:
-        return None
+    if not users: return None
     user = users[0]
     uuid = user.get('id')
-    if not uuid:
-        return None
+    if not uuid: return None
     encryption = user.get('encryption', 'none')
     flow = user.get('flow', '')
     stream = out.get('streamSettings', {})
@@ -349,12 +355,10 @@ def outbound_to_vless_url(out: dict) -> Optional[str]:
 def outbound_to_trojan_url(out: dict) -> Optional[str]:
     settings = out.get('settings', {})
     servers = settings.get('servers', [])
-    if not servers:
-        return None
+    if not servers: return None
     s = servers[0]
     address = s.get('address'); port = s.get('port'); password = s.get('password')
-    if not all([address, port, password]):
-        return None
+    if not all([address, port, password]): return None
     stream = out.get('streamSettings', {})
     security = stream.get('security', 'tls')
     tls = stream.get('tlsSettings', {})
@@ -385,12 +389,10 @@ def outbound_to_trojan_url(out: dict) -> Optional[str]:
 def outbound_to_hysteria2_url(out: dict) -> Optional[str]:
     settings = out.get('settings', {})
     servers = settings.get('servers', [])
-    if not servers:
-        return None
+    if not servers: return None
     s = servers[0]
     address = s.get('address'); port = s.get('port'); auth = s.get('auth', '')
-    if not address or not port:
-        return None
+    if not address or not port: return None
     stream = out.get('streamSettings', {})
     security = stream.get('security', 'tls')
     tls = stream.get('tlsSettings', {})
@@ -414,8 +416,7 @@ def outbound_to_hysteria2_url(out: dict) -> Optional[str]:
 def yaml_proxy_to_vless_url(proxy: dict) -> Optional[str]:
     name = proxy.get('name', ''); server = proxy.get('server')
     port = proxy.get('port'); uuid = proxy.get('uuid')
-    if not all([server, port, uuid]):
-        return None
+    if not all([server, port, uuid]): return None
     params = {'encryption': 'none', 'type': proxy.get('network', 'tcp')}
     if proxy.get('flow'): params['flow'] = proxy['flow']
     tls = proxy.get('tls', False)
@@ -448,8 +449,7 @@ def yaml_proxy_to_vless_url(proxy: dict) -> Optional[str]:
 def yaml_proxy_to_trojan_url(proxy: dict) -> Optional[str]:
     name = proxy.get('name', ''); server = proxy.get('server')
     port = proxy.get('port'); password = proxy.get('password')
-    if not all([server, port, password]):
-        return None
+    if not all([server, port, password]): return None
     params = {}
     sni = proxy.get('servername')
     if sni: params['sni'] = sni
@@ -467,8 +467,7 @@ def yaml_proxy_to_trojan_url(proxy: dict) -> Optional[str]:
 def yaml_proxy_to_hysteria2_url(proxy: dict) -> Optional[str]:
     name = proxy.get('name', ''); server = proxy.get('server')
     port = proxy.get('port'); auth = proxy.get('auth', '')
-    if not all([server, port]):
-        return None
+    if not all([server, port]): return None
     params = {}
     sni = proxy.get('servername')
     if sni: params['sni'] = sni
@@ -501,8 +500,7 @@ def convert_json_to_urls(content: str) -> List[str]:
                 if not outbounds or not isinstance(outbounds, list):
                     continue
                 for out in outbounds:
-                    if not isinstance(out, dict):
-                        continue
+                    if not isinstance(out, dict): continue
                     protocol = out.get('protocol', '')
                     if protocol == 'vless':
                         url = outbound_to_vless_url(out)
@@ -523,23 +521,16 @@ def convert_yaml_to_urls(content: str) -> List[str]:
     urls = []
     try:
         data = yaml.safe_load(content)
-        if not data or not isinstance(data, dict):
-            return []
+        if not data or not isinstance(data, dict): return []
         proxies = data.get('proxies', [])
-        if not isinstance(proxies, list):
-            return []
+        if not isinstance(proxies, list): return []
         for proxy in proxies:
             ptype = proxy.get('type')
-            if ptype == 'vless':
-                url = yaml_proxy_to_vless_url(proxy)
-            elif ptype == 'trojan':
-                url = yaml_proxy_to_trojan_url(proxy)
-            elif ptype in ('hysteria2', 'hy2'):
-                url = yaml_proxy_to_hysteria2_url(proxy)
-            else:
-                continue
-            if url and is_valid_config(url):
-                urls.append(url)
+            if ptype == 'vless': url = yaml_proxy_to_vless_url(proxy)
+            elif ptype == 'trojan': url = yaml_proxy_to_trojan_url(proxy)
+            elif ptype in ('hysteria2', 'hy2'): url = yaml_proxy_to_hysteria2_url(proxy)
+            else: continue
+            if url and is_valid_config(url): urls.append(url)
     except Exception:
         pass
     return urls
@@ -556,8 +547,7 @@ def decode_base64_content(content: str) -> Tuple[Optional[str], List[str]]:
         matches.extend(HY2_REGEX.findall(decoded))
         if len(decoded) > 100 and BASE64_REGEX.match(decoded.replace('\n', '').replace('\r', '')):
             deeper = decode_base64_content(decoded)
-            if deeper[1]:
-                matches.extend(deeper[1])
+            if deeper[1]: matches.extend(deeper[1])
         return decoded, matches
     except Exception:
         return None, []
@@ -598,10 +588,12 @@ def extract_configs_from_text(text: str):
 
     return vless_list, trojan_list, hy2_list, base64_count, json_count, yaml_count
 
+# ============================================================================
+# Happ
+# ============================================================================
 def fetch_with_happ_method(url: str) -> Optional[str]:
     parsed = _safe_urlparse(url)
-    if parsed is None:
-        return None
+    if parsed is None: return None
     if 'hwid=' not in url:
         separator = '&' if parsed.query else '?'
         url_with_hwid = f"{url}{separator}hwid={HWID_STATIC}"
@@ -610,27 +602,24 @@ def fetch_with_happ_method(url: str) -> Optional[str]:
     for try_url in [url_with_hwid, url]:
         for ua in HAPP_USER_AGENTS:
             try:
-                headers = {
-                    "User-Agent": ua,
-                    "X-HWID": HWID_STATIC,
-                    "Accept": "*/*",
-                    "Accept-Encoding": "gzip, deflate",
-                    "Connection": "keep-alive",
-                }
+                headers = {"User-Agent": ua, "X-HWID": HWID_STATIC,
+                           "Accept": "*/*", "Accept-Encoding": "gzip, deflate",
+                           "Connection": "keep-alive"}
                 resp = requests.get(try_url, headers=headers, timeout=TIMEOUT_HAPP)
                 resp.raise_for_status()
                 content = resp.text.strip()
-                if "<html" in content.lower():
-                    continue
+                if "<html" in content.lower(): continue
                 if BASE64_REGEX.match(content.replace('\n', '').replace('\r', '')):
                     decoded = base64.b64decode(content).decode('utf-8', errors='ignore')
-                    if decoded:
-                        content = decoded
+                    if decoded: content = decoded
                 return content
             except Exception:
                 continue
     return None
 
+# ============================================================================
+# Загрузка источников
+# ============================================================================
 async def process_source(session, url, sem, stats, stats_lock):
     async with sem:
         content = None
@@ -641,18 +630,15 @@ async def process_source(session, url, sem, stats, stats_lock):
                     content = await resp.text()
         except Exception:
             pass
-
         if content is None or len(content) < 50:
             loop = asyncio.get_event_loop()
             with ThreadPoolExecutor(max_workers=1) as executor:
                 content = await loop.run_in_executor(executor, fetch_with_happ_method, url)
             used_happ = True
-
         if not content or len(content) < 10:
             async with stats_lock:
                 stats['failed'].append(url)
             return
-
         vless_list, trojan_list, hy2_list, b64_cnt, json_cnt, yaml_cnt = \
             extract_configs_from_text(content)
         total_found = len(vless_list) + len(trojan_list) + len(hy2_list)
@@ -660,7 +646,6 @@ async def process_source(session, url, sem, stats, stats_lock):
             async with stats_lock:
                 stats['failed'].append(url)
             return
-
         async with stats_lock:
             stats['processed'] += 1
             stats['vless_count'] += len(vless_list)
@@ -673,8 +658,7 @@ async def process_source(session, url, sem, stats, stats_lock):
             stats['all_configs'].extend(vless_list)
             stats['all_configs'].extend(trojan_list)
             stats['all_configs'].extend(hy2_list)
-            if used_happ:
-                stats['happ_success'] += 1
+            if used_happ: stats['happ_success'] += 1
 
 async def display_progress(stats):
     while True:
@@ -686,13 +670,10 @@ async def display_progress(stats):
         bar = '█' * filled + '░' * (bar_len - filled)
         v = stats['vless_count']; t = stats['trojan_count']; h = stats['hy2_count']
         subs = stats['base64'] + stats['json'] + stats['yaml']
-        total_cfgs = stats['total_configs']
-        happ = stats['happ_success']
         sys.stdout.write(
             f"\r|{bar}| {percent:.0f}% Скачано: {processed}/{total} | "
             f"VLESS: {v} | Trojan: {t} | Hysteria2: {h} | "
-            f"Декодировано: {subs} | Happ: {happ} | Всего: {total_cfgs}"
-        )
+            f"Декодировано: {subs} | Happ: {stats['happ_success']} | Всего: {stats['total_configs']}")
         sys.stdout.flush()
         await asyncio.sleep(0.3)
 
@@ -723,18 +704,14 @@ async def load_http_sources():
                 cfg = line.strip()
                 if cfg and is_valid_config(cfg):
                     my_configs.append(cfg)
-        print(f"  Мои конфиги: {len(my_configs)} (будут добавлены в итоговый файл)")
+        print(f"  Мои конфиги: {len(my_configs)}")
 
     stats = {
-        'processed': 0,
-        'total_sources': total_sources,
+        'processed': 0, 'total_sources': total_sources,
         'vless_count': 0, 'trojan_count': 0, 'hy2_count': 0,
         'base64': 0, 'json': 0, 'yaml': 0,
-        'total_configs': 0,
-        'all_configs': [],
-        'failed': [],
-        'happ_success': 0,
-        'lock': asyncio.Lock(),
+        'total_configs': 0, 'all_configs': [], 'failed': [],
+        'happ_success': 0, 'lock': asyncio.Lock(),
     }
 
     sem = asyncio.Semaphore(THREADS)
@@ -758,29 +735,26 @@ async def load_http_sources():
         async with aiofiles.open(SOURCES_FILE, 'w', encoding='utf-8') as f:
             for url in remaining:
                 await f.write(url + '\n')
-        print(f"Удалено неудачных источников: {len(stats['failed'])} "
-              f"(добавлены в {BLACKLIST_FILE})")
+        print(f"Удалено неудачных источников: {len(stats['failed'])}")
 
     all_configs = stats['all_configs'] + my_configs
     if all_configs:
-        async with aiofiles.open(CONFIGS_FILE, 'a', encoding='utf-8') as f:
+        # Перезаписываем, а не дописываем — фикс раздувания
+        async with aiofiles.open(CONFIGS_FILE, 'w', encoding='utf-8') as f:
             for cfg in all_configs:
                 await f.write(cfg + '\n')
-        print(f"Добавлено конфигов в {CONFIGS_FILE}: {len(all_configs)}")
+        print(f"Записано конфигов в {CONFIGS_FILE}: {len(all_configs)}")
     else:
         print("Конфигов не найдено.")
 
-    print(f"\n  Обработано источников: {stats['processed']}/{total_sources}")
-    print(f"Всего извлечено конфигов: {stats['total_configs']}")
-    print(f"VLESS: {stats['vless_count']} | Trojan: {stats['trojan_count']} | "
-          f"Hysteria2: {stats['hy2_count']}")
-    print(f"Расшифровано подписок: {stats['base64']+stats['json']+stats['yaml']} "
-          f"(Base64: {stats['base64']}, JSON: {stats['json']}, YAML: {stats['yaml']})")
-    print(f"Обработано через Happ: {stats['happ_success']}")
-    print(f"Мои конфиги: {len(my_configs)}")
-
+    print(f"\n  Обработано: {stats['processed']}/{total_sources}")
+    print(f"  VLESS: {stats['vless_count']} | Trojan: {stats['trojan_count']} | Hysteria2: {stats['hy2_count']}")
+    print(f"  Мои конфиги: {len(my_configs)}")
     return stats['all_configs'], my_configs, stats
 
+# ============================================================================
+# Proxy + парсер URI
+# ============================================================================
 @dataclass
 class Proxy:
     raw: str = ""
@@ -802,18 +776,14 @@ class Proxy:
         if self.kind == "vmess":
             parts.append(str(p.get("alterId", "")))
         eh = _extra_hash(p.get("extra"))
-        if eh:
-            parts.append(eh)
+        if eh: parts.append(eh)
         return "|".join(parts)
 
 def _p_vmess(uri):
     d = _b64decode(uri[len("vmess://"):].strip())
-    if not d:
-        return None
-    try:
-        cfg = json.loads(d)
-    except Exception:
-        return None
+    if not d: return None
+    try: cfg = json.loads(d)
+    except Exception: return None
     tls_on = (cfg.get("tls", "") or "").lower() in ("tls", "reality")
     return Proxy(raw=uri, kind="vmess", name=cfg.get("ps", ""), params={
         "server": cfg.get("add", ""), "port": _safe_int(cfg.get("port"), 443),
@@ -830,16 +800,13 @@ def _p_vmess(uri):
 
 def _p_vless(uri):
     u = _safe_urlparse(uri)
-    if u is None or not u.hostname:
-        return None
+    if u is None or not u.hostname: return None
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     extra = {}
     raw_extra = q.get("extra", "")
     if raw_extra:
-        try:
-            extra = json.loads(unquote(raw_extra))
-        except Exception:
-            extra = {}
+        try: extra = json.loads(unquote(raw_extra))
+        except Exception: extra = {}
     return Proxy(raw=uri, kind="vless",
                  name=unquote(u.fragment) if u.fragment else "",
                  params={
@@ -858,8 +825,7 @@ def _p_vless(uri):
 
 def _p_trojan(uri):
     u = _safe_urlparse(uri)
-    if u is None or not u.hostname:
-        return None
+    if u is None or not u.hostname: return None
     q = {k: v[0] for k, v in parse_qs(u.query).items()}
     return Proxy(raw=uri, kind="trojan",
                  name=unquote(u.fragment) if u.fragment else "",
@@ -882,14 +848,12 @@ def _p_ss(uri):
     tag = unquote(tag) if tag else ""
     if "@" not in body:
         d = _b64decode(body)
-        if "@" not in d:
-            return None
+        if "@" not in d: return None
         method_pw, host_port = d.rsplit("@", 1)
     else:
         ui, host_port = body.rsplit("@", 1)
         method_pw = unquote(ui) if ":" in ui else _b64decode(ui)
-    if ":" not in method_pw or ":" not in host_port:
-        return None
+    if ":" not in method_pw or ":" not in host_port: return None
     method, password = method_pw.split(":", 1)
     host, port = host_port.rsplit(":", 1)
     return Proxy(raw=uri, kind="ss", name=tag, params={
@@ -903,14 +867,11 @@ _P = {"vmess://": _p_vmess, "vless://": _p_vless,
 
 def parse_uri(uri):
     uri = uri.strip()
-    if not uri or uri.startswith("#"):
-        return None
+    if not uri or uri.startswith("#"): return None
     for p, fn in _P.items():
         if uri.startswith(p):
-            try:
-                return fn(uri)
-            except Exception:
-                return None
+            try: return fn(uri)
+            except Exception: return None
     return None
 
 def _extract_uris(text):
@@ -918,18 +879,14 @@ def _extract_uris(text):
 
 def _host_ws(ss):
     ws = ss.get("wsSettings") or {}
-    if ws.get("host"):
-        return ws["host"]
+    if ws.get("host"): return ws["host"]
     hv = (ws.get("headers") or {}).get("Host")
-    if isinstance(hv, list) and hv:
-        return hv[0]
+    if isinstance(hv, list) and hv: return hv[0]
     return hv if isinstance(hv, str) else ""
 
 def _parse_json_sub(text):
-    try:
-        data = json.loads(text)
-    except Exception:
-        return []
+    try: data = json.loads(text)
+    except Exception: return []
     obs = []
     if isinstance(data, dict):
         obs = data.get("outbounds") or []
@@ -938,12 +895,9 @@ def _parse_json_sub(text):
                 obs.extend(c.get("outbounds", []))
     elif isinstance(data, list):
         for item in data:
-            if not isinstance(item, dict):
-                continue
-            if "outbounds" in item:
-                obs.extend(item.get("outbounds") or [])
-            elif item.get("protocol"):
-                obs.append(item)
+            if not isinstance(item, dict): continue
+            if "outbounds" in item: obs.extend(item.get("outbounds") or [])
+            elif item.get("protocol"): obs.append(item)
     return [r for r in (_ob_to_proxy(o) for o in obs) if r]
 
 def _ob_to_proxy(ob):
@@ -1008,8 +962,7 @@ def _ob_to_proxy(ob):
 
 def parse_response_body(body):
     body = body.strip()
-    if not body:
-        return []
+    if not body: return []
     if body.lstrip().startswith(("{", "[")):
         return _parse_json_sub(body)
     uris = _extract_uris(body)
@@ -1020,8 +973,7 @@ def parse_response_body(body):
         dd = d.strip()
         if dd.lstrip().startswith(("{", "[")):
             jp = _parse_json_sub(dd)
-            if jp:
-                return jp
+            if jp: return jp
         return [p for p in (parse_uri(u) for u in _extract_uris(dd)) if p]
     return []
 
@@ -1035,16 +987,14 @@ def dump_to_uri(pr, override_name=None):
         if p.get("security") and p["security"] != "none": q.append(f"security={p['security']}")
         if p.get("network") and p["network"] != "tcp":    q.append(f"type={p['network']}")
         for k in ("sni", "fp", "pbk", "sid", "spx", "flow", "path", "host", "mode", "serviceName"):
-            if p.get(k):
-                q.append(f"{k}={p[k]}")
+            if p.get(k): q.append(f"{k}={p[k]}")
         if p.get("alpn"):       q.append(f"alpn={p['alpn']}")
         if p.get("headerType"): q.append(f"headerType={p['headerType']}")
         if p.get("extra"):
             try:
                 js = json.dumps(p["extra"], ensure_ascii=False, separators=(",", ":"))
                 q.append(f"extra={quote(js, safe='')}")
-            except Exception:
-                pass
+            except Exception: pass
         frag = f"#{name}" if name else ""
         return f"vless://{p.get('uuid','')}@{p['server']}:{p['port']}?{'&'.join(q)}{frag}"
     if pr.kind == "trojan":
@@ -1064,30 +1014,107 @@ def dump_to_uri(pr, override_name=None):
                "type": "none", "host": p.get("host", ""), "path": p.get("path", ""),
                "tls": "tls" if p.get("tls") else "", "sni": p.get("sni", ""),
                "fp": p.get("fp", "")}
-        if p.get("extra"):
-            obj["extra"] = p["extra"]
+        if p.get("extra"): obj["extra"] = p["extra"]
         return "vmess://" + base64.b64encode(
             json.dumps(obj, ensure_ascii=False).encode()).decode()
     return pr.raw or ""
 
+# ============================================================================
+# Cache
+# ============================================================================
 class Cache:
     def __init__(self, path):
-        self.path = path
+        self.path = Path(path)
+        self.parts_dir = self.path.parent / f"{self.path.stem}_parts"
         self.items = {}
         self.lock = threading.Lock()
-        if path.exists():
+        self._load()
+
+    def _load(self):
+        if self.parts_dir.exists():
+            part_files = sorted(self.parts_dir.glob("*.json"))
+            if part_files:
+                loaded = 0
+                for p in part_files:
+                    try:
+                        data = json.loads(p.read_text(encoding="utf-8"))
+                        items = data.get("items", {})
+                        if isinstance(items, dict):
+                            self.items.update(items)
+                            loaded += 1
+                    except Exception as e:
+                        print(f"[!] кэш-часть {p.name} не прочитана: {e}")
+                if loaded:
+                    print(f"[i] кэш собран из {loaded} частей ({len(self.items)} записей)")
+                return
+        if self.path.exists():
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8"))
                 self.items = data.get("items", {}) or {}
             except Exception as e:
                 print(f"[!] кэш не прочитан: {e}")
 
     def save(self):
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(
-            {"version": CACHE_VERSION, "updated": _now(), "items": self.items},
-            ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        payload = {"version": CACHE_VERSION, "updated": _now(), "items": self.items}
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        size = len(serialized.encode("utf-8"))
+
+        if size <= CACHE_SPLIT_THRESHOLD_BYTES:
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            tmp.replace(self.path)
+            if self.parts_dir.exists():
+                for p in self.parts_dir.glob("*.json"):
+                    try: p.unlink()
+                    except Exception: pass
+                try: self.parts_dir.rmdir()
+                except Exception: pass
+            print(f"[i] кэш сохранён: {self.path} "
+                  f"({size/1024/1024:.1f} MB, {len(self.items)} записей)")
+            return
+
+        self.parts_dir.mkdir(exist_ok=True)
+        for p in self.parts_dir.glob("*.json"):
+            try: p.unlink()
+            except Exception: pass
+
+        target_bytes = int(CACHE_SPLIT_THRESHOLD_BYTES * 0.85)
+        overhead = 256
+
+        items_with_size = []
+        for k, v in self.items.items():
+            sz = len(json.dumps({k: v}, ensure_ascii=False,
+                                separators=(",", ":")).encode("utf-8"))
+            items_with_size.append((k, v, sz))
+
+        chunks = []
+        current = {}
+        current_size = 0
+        for k, v, sz in items_with_size:
+            if (current_size + sz + overhead) > target_bytes and current:
+                chunks.append(current)
+                current = {k: v}
+                current_size = sz
+            else:
+                current[k] = v
+                current_size += sz
+        if current: chunks.append(current)
+
+        for i, chunk in enumerate(chunks):
+            part_path = self.parts_dir / f"part_{i:03d}.json"
+            part_path.write_text(json.dumps({
+                "version": CACHE_VERSION, "updated": _now(),
+                "part": i, "total_parts": len(chunks), "items": chunk,
+            }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+        if self.path.exists():
+            try: self.path.unlink()
+            except Exception: pass
+
+        part_sizes = sum(p.stat().st_size for p in self.parts_dir.glob("*.json"))
+        print(f"[i] кэш разбит на {len(chunks)} частей в {self.parts_dir}/ "
+              f"({size/1024/1024:.1f} MB → {part_sizes/1024/1024:.1f} MB)")
 
     def upsert(self, pr, result, sub_index):
         key = pr.dedup_key()
@@ -1107,17 +1134,13 @@ class Cache:
                       "consecutive_ok": 0, "total_checks": 0, "total_ok": 0,
                       "first_working": None}
             else:
-                if pr.raw:
-                    it["raw"] = pr.raw
+                if pr.raw: it["raw"] = pr.raw
                 if pr.name and pr.name != it.get("name"):
                     al = it.setdefault("aliases", [])
-                    if it["name"] and it["name"] not in al:
-                        al.append(it["name"])
-                    if pr.name not in al:
-                        al.append(pr.name)
+                    if it["name"] and it["name"] not in al: al.append(it["name"])
+                    if pr.name not in al: al.append(pr.name)
                     it["name"] = pr.name
-                if "first_sub_index" not in it:
-                    it["first_sub_index"] = sub_index
+                if "first_sub_index" not in it: it["first_sub_index"] = sub_index
                 it.setdefault("consecutive_ok", 0)
                 it.setdefault("total_checks", 0)
                 it.setdefault("total_ok", 0)
@@ -1143,8 +1166,7 @@ class Cache:
                 it["fail_count"] = 0
                 it["consecutive_ok"] = int(it.get("consecutive_ok", 0)) + 1
                 it["total_ok"] = int(it.get("total_ok", 0)) + 1
-                if not it.get("first_working"):
-                    it["first_working"] = it["last_working"]
+                if not it.get("first_working"): it["first_working"] = it["last_working"]
             else:
                 it["status"] = "unworking"
                 it["fail_count"] = int(it.get("fail_count", 0)) + 1
@@ -1171,47 +1193,34 @@ class Cache:
                 m.setdefault(v.get("first_sub_index", 0), []).append(self.to_proxy(v))
         return m
 
-    def is_stable(self, item, min_checks=3, min_rate=0.8,
-                  min_consecutive=2, recent_hours=72):
-        if not item or item.get("status") != "working":
-            return False
-        total = int(item.get("total_checks", 0))
-        ok = int(item.get("total_ok", 0))
-        if total < min_checks or ok < min_checks:
-            return False
-        if total > 0 and (ok / total) < min_rate:
-            return False
-        if int(item.get("consecutive_ok", 0)) < min_consecutive:
-            return False
+    def is_stable(self, item, min_checks=3, min_rate=0.8, min_consecutive=2, recent_hours=72):
+        if not item or item.get("status") != "working": return False
+        total = int(item.get("total_checks", 0)); ok = int(item.get("total_ok", 0))
+        if total < min_checks or ok < min_checks: return False
+        if total > 0 and (ok / total) < min_rate: return False
+        if int(item.get("consecutive_ok", 0)) < min_consecutive: return False
         lw = item.get("last_working")
-        if not lw:
-            return False
+        if not lw: return False
         try:
             dt = datetime.strptime(lw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
             if (datetime.now(timezone.utc) - dt).total_seconds() > recent_hours * 3600:
                 return False
-        except Exception:
-            return False
+        except Exception: return False
         return True
 
-    def stable_all(self, min_checks=3, min_rate=0.8,
-                   min_consecutive=2, recent_hours=72):
+    def stable_all(self, min_checks=3, min_rate=0.8, min_consecutive=2, recent_hours=72):
         return [self.to_proxy(v) for v in self.items.values()
                 if self.is_stable(v, min_checks=min_checks, min_rate=min_rate,
-                                  min_consecutive=min_consecutive,
-                                  recent_hours=recent_hours)
+                                  min_consecutive=min_consecutive, recent_hours=recent_hours)
                 and v.get("params", {}).get("server")]
 
     def is_new(self, item, recent_hours=24.0):
-        if not item or item.get("status") != "working":
-            return False
+        if not item or item.get("status") != "working": return False
         fs = item.get("first_seen")
-        if not fs:
-            return False
+        if not fs: return False
         try:
             dt = datetime.strptime(fs, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except Exception:
-            return False
+        except Exception: return False
         return (datetime.now(timezone.utc) - dt).total_seconds() <= recent_hours * 3600
 
     def new_all(self, recent_hours=24.0):
@@ -1220,8 +1229,7 @@ class Cache:
                 and v.get("params", {}).get("server")]
 
     def classify(self, item, stable_cfg=None, new_cfg=None):
-        if not item:
-            return "regular"
+        if not item: return "regular"
         if (new_cfg and new_cfg.get("enabled", True)
                 and self.is_new(item, recent_hours=new_cfg.get("recent_hours", 24))):
             return "new"
@@ -1234,6 +1242,20 @@ class Cache:
             return "stable"
         return "regular"
 
+    def is_blacklisted(self, item):
+        if not item: return False
+        if item.get("status") != "unworking": return False
+        return int(item.get("fail_count", 0)) >= BLACKLIST_FAIL_THRESHOLD
+
+    def blacklisted_keys(self):
+        return {k for k, v in self.items.items() if self.is_blacklisted(v)}
+
+    def blacklisted_items(self):
+        return [v for v in self.items.values() if self.is_blacklisted(v)]
+
+# ============================================================================
+# Xray Manager
+# ============================================================================
 def _download(url, dest, attempts=3, timeout=120):
     for i in range(1, attempts + 1):
         try:
@@ -1244,8 +1266,7 @@ def _download(url, dest, attempts=3, timeout=120):
                 got = 0
                 with dest.open("wb") as f:
                     for chunk in r.iter_content(65536):
-                        if not chunk:
-                            continue
+                        if not chunk: continue
                         f.write(chunk)
                         got += len(chunk)
                         if total:
@@ -1261,12 +1282,9 @@ def _download(url, dest, attempts=3, timeout=120):
             print(f"\n    [!] попытка {i}/{attempts}: "
                   f"{type(e).__name__}: {e}", flush=True)
             if dest.exists():
-                try:
-                    dest.unlink()
-                except Exception:
-                    pass
-            if i < attempts:
-                time.sleep(3)
+                try: dest.unlink()
+                except Exception: pass
+            if i < attempts: time.sleep(3)
     return False
 
 class XrayManager:
@@ -1308,10 +1326,8 @@ class XrayManager:
             with zipfile.ZipFile(z) as zf:
                 zf.extractall(self.dir)
         finally:
-            try:
-                z.unlink()
-            except Exception:
-                pass
+            try: z.unlink()
+            except Exception: pass
         if not self.bin.exists():
             for p in self.dir.iterdir():
                 if p.is_file() and p.stem.lower() == "xray":
@@ -1332,10 +1348,23 @@ class XrayManager:
                          stdout=_sp.PIPE, stderr=_sp.PIPE,
                          stdin=_sp.DEVNULL, **kw)
 
+# ─── Порт-менеджер без race condition ───
+_PORT_LOCK = threading.Lock()
+_used_ports: Set[int] = set()
+
 def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    with _PORT_LOCK:
+        for _ in range(2000):
+            p = random.randint(20000, 60000)
+            if p in _used_ports:
+                continue
+            _used_ports.add(p)
+            return p
+    raise RuntimeError("не нашёл свободный порт")
+
+def _release_port(port):
+    with _PORT_LOCK:
+        _used_ports.discard(port)
 
 def _wait_port(port, timeout=6.0):
     end = time.time() + timeout
@@ -1347,14 +1376,14 @@ def _wait_port(port, timeout=6.0):
             time.sleep(0.05)
     return False
 
+# ============================================================================
+# Checker
+# ============================================================================
 def _get_iface_ip(name):
-    try:
-        import psutil
-    except ImportError:
-        return None
+    try: import psutil
+    except ImportError: return None
     addrs = psutil.net_if_addrs()
-    if name not in addrs:
-        return None
+    if name not in addrs: return None
     for a in addrs[name]:
         if a.family == socket.AF_INET and not a.address.startswith(("127.", "169.254.")):
             return a.address
@@ -1367,8 +1396,7 @@ def _stream_settings(p):
     ss = {"network": net}
     if net == "ws":
         ws = {"path": p.get("path", "/") or "/"}
-        if p.get("host"):
-            ws["headers"] = {"Host": p["host"]}
+        if p.get("host"): ws["headers"] = {"Host": p["host"]}
         ss["wsSettings"] = ws
     elif net == "grpc":
         g = {}
@@ -1377,15 +1405,13 @@ def _stream_settings(p):
         ss["grpcSettings"] = g
     elif net == "httpupgrade":
         hu = {"path": p.get("path", "/") or "/"}
-        if p.get("host"):
-            hu["host"] = p["host"]
+        if p.get("host"): hu["host"] = p["host"]
         ss["httpupgradeSettings"] = hu
     elif net == "xhttp":
         xh = {"path": p.get("path", "/") or "/",
               "mode": p.get("mode", "") or "auto"}
         if p.get("host"): xh["host"] = p["host"]
-        if extra:
-            xh["extra"] = extra
+        if extra: xh["extra"] = extra
         ss["xhttpSettings"] = xh
     elif net == "tcp" and p.get("headerType") == "http":
         ss["tcpSettings"] = {"header": {"type": "http",
@@ -1413,8 +1439,7 @@ def _outbound(pr):
     p = pr.params; k = pr.kind
     if k == "vless":
         u = {"id": p.get("uuid", ""), "encryption": "none"}
-        if p.get("flow"):
-            u["flow"] = p["flow"]
+        if p.get("flow"): u["flow"] = p["flow"]
         return {"protocol": "vless",
                 "settings": {"vnext": [{"address": p["server"], "port": p["port"],
                                         "users": [u]}]},
@@ -1439,8 +1464,7 @@ def _outbound(pr):
     raise ValueError(k)
 
 def _parse_country_response(name, data):
-    if not isinstance(data, dict):
-        return "", "", ""
+    if not isinstance(data, dict): return "", "", ""
     try:
         if name == "ip-api" and data.get("status") == "success":
             return data.get("countryCode", ""), data.get("country", ""), data.get("query", "")
@@ -1450,23 +1474,19 @@ def _parse_country_response(name, data):
             return data.get("country_code", ""), data.get("country_name", ""), data.get("ip", "")
         if name == "ipinfo" and data.get("country"):
             return data.get("country", ""), data.get("country", ""), data.get("ip", "")
-    except Exception:
-        pass
+    except Exception: pass
     return "", "", ""
 
 def _detect_country(session, timeout):
     for url, name in COUNTRY_SOURCES:
-        if not _COUNTRY_SEM.acquire(timeout=timeout):
-            continue
+        if not _COUNTRY_SEM.acquire(timeout=timeout): continue
         try:
             try:
                 r = session.get(url, timeout=timeout)
                 if r.status_code == 200:
                     cc, cn, ip = _parse_country_response(name, r.json())
-                    if cc:
-                        return cc, cn, ip
-            except Exception:
-                pass
+                    if cc: return cc, cn, ip
+            except Exception: pass
         finally:
             _COUNTRY_SEM.release()
     return "", "", ""
@@ -1508,10 +1528,8 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 _, e = proc.communicate(timeout=1)
                 if e:
                     lines = e.decode("utf-8", "replace").strip().splitlines()
-                    if lines:
-                        msg = " | ".join(lines[-2:])[:180]
-            except Exception:
-                pass
+                    if lines: msg = " | ".join(lines[-2:])[:180]
+            except Exception: pass
             return {"ok": False, "latency": None, "latency_keepalive": None,
                     "download_mbps": None, "upload_mbps": None,
                     "ip": None, "country_code": "", "country": "",
@@ -1526,9 +1544,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
         session.mount("http://", HTTPAdapter(max_retries=0))
         session.mount("https://", HTTPAdapter(max_retries=0))
 
-        lat = None
-        working_url = None
-        last_err = "нет ответа"
+        lat = None; working_url = None; last_err = "нет ответа"
         for url in TEST_URLS_FALLBACK:
             req_budget = min(remaining(), timeout)
             if req_budget <= 0.3:
@@ -1539,9 +1555,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 r1 = session.get(url, timeout=req_budget)
                 dt = int((time.perf_counter() - t0) * 1000)
                 if r1.status_code in (200, 204, 301, 302):
-                    lat = dt
-                    working_url = url
-                    break
+                    lat = dt; working_url = url; break
                 last_err = f"HTTP {r1.status_code}"
             except requests.exceptions.RequestException as e:
                 last_err = str(e)[:60]
@@ -1564,15 +1578,12 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 lat_ka = int((time.perf_counter() - t0) * 1000)
                 if r2.status_code not in (200, 204, 301, 302):
                     lat_ka = None
-            except Exception:
-                lat_ka = None
+            except Exception: lat_ka = None
 
-        down_mbps = None
-        up_mbps = None
+        down_mbps = None; up_mbps = None
         if speed_test:
             down_mbps = _measure_download_speed(session, speed_timeout)
-            if require_upload:
-                up_mbps = _measure_upload_speed(session, speed_timeout)
+            if require_upload: up_mbps = _measure_upload_speed(session, speed_timeout)
             speed_ok = (down_mbps is not None and down_mbps >= min_down)
             if require_upload:
                 speed_ok = speed_ok and (up_mbps is not None and up_mbps >= min_up)
@@ -1593,19 +1604,15 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             if country_budget > 0.3:
                 try:
                     r = session.get(IP_URL, timeout=country_budget)
-                    if r.status_code == 200:
-                        ip = r.text.strip()
-                except Exception:
-                    pass
+                    if r.status_code == 200: ip = r.text.strip()
+                except Exception: pass
         elif country_budget > 0.3:
             cc, cn, ip = _detect_country(session, country_budget)
             if not ip and remaining() > 0.3:
                 try:
                     r = session.get(IP_URL, timeout=min(remaining(), 2.0))
-                    if r.status_code == 200:
-                        ip = r.text.strip()
-                except Exception:
-                    pass
+                    if r.status_code == 200: ip = r.text.strip()
+                except Exception: pass
 
         session.close()
         return {"ok": True, "latency": lat, "latency_keepalive": lat_ka,
@@ -1615,48 +1622,22 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 "elapsed": round(time.time() - t_start, 2)}
     finally:
         if proc:
-            try:
-                proc.terminate(); proc.wait(2)
+            try: proc.terminate(); proc.wait(2)
             except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                try: proc.kill()
+                except Exception: pass
         cp.unlink(missing_ok=True)
+        _release_port(port)
 
-def fetch_url(url, timeout=20):
-    try:
-        s = requests.Session()
-        s.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*",
-                          "Accept-Encoding": "gzip, deflate, br"})
-        s.mount("http://", HTTPAdapter(max_retries=2))
-        s.mount("https://", HTTPAdapter(max_retries=2))
-        r = s.get(url, timeout=timeout, allow_redirects=True)
-        if r.status_code != 200:
-            print(f"    [!] HTTP {r.status_code}")
-            return None
-        return r.text
-    except requests.exceptions.SSLError:
-        try:
-            r = requests.get(url, timeout=timeout, verify=False,
-                             headers={"User-Agent": USER_AGENT})
-            if r.status_code == 200:
-                return r.text
-        except Exception:
-            pass
-        return None
-    except Exception as e:
-        print(f"    [!] {e}")
-        return None
-
+# ============================================================================
+# Отчёты, OutputWriter
+# ============================================================================
 def _dedup(proxies):
     seen = set(); out = []
     for p in proxies:
-        if not p or not p.params.get("server"):
-            continue
+        if not p or not p.params.get("server"): continue
         k = p.dedup_key()
-        if k in seen:
-            continue
+        if k in seen: continue
         seen.add(k); out.append(p)
     return out
 
@@ -1664,24 +1645,21 @@ def _load_recheck_files(paths):
     result = []
     for path_str in paths:
         path_str = path_str.strip()
-        if not path_str:
-            continue
+        if not path_str: continue
         p = Path(path_str)
         if not p.exists():
-            print(f"[i] recheck: {path_str} — не найден, пропуск")
+            print(f"[i] recheck: {path_str} — не найден")
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
-            print(f"[!] recheck: не удалось прочитать {path_str}: {e}")
+            print(f"[!] recheck: {path_str}: {e}")
             continue
-
         parsed = parse_response_body(text)
         if not parsed:
             for u in _extract_uris(text):
                 pr = parse_uri(u)
-                if pr:
-                    parsed.append(pr)
+                if pr: parsed.append(pr)
         print(f"[i] recheck: {path_str} → {len(parsed)} серверов")
         result.extend(parsed)
     return _dedup(result)
@@ -1706,27 +1684,20 @@ def _build_country_config(cc, cn, servers, cluster="regular",
     outbounds.append({"protocol": "blackhole", "tag": "block"})
 
     balancer_tag = f"{prefix_id}-balancer"
-    balancer = {
-        "tag": balancer_tag,
-        "selector": tags,
-        "strategy": {"type": "leastLoad", "settings": {
-            "maxRTT": "1s",
-            "expected": min(2, max(1, len(tags))),
-            "baselines": ["1s"],
-            "tolerance": 0.01}},
-    }
+    balancer = {"tag": balancer_tag, "selector": tags,
+                "strategy": {"type": "leastLoad", "settings": {
+                    "maxRTT": "1s", "expected": min(2, max(1, len(tags))),
+                    "baselines": ["1s"], "tolerance": 0.01}}}
 
-    domains_direct = [
-        "vk.com", "yandex.ru", "mail.ru", "ok.ru", "gosuslugi.ru", "kremlin.ru",
-        "ozon.ru", "wildberries.ru", "vseinstrumenti.ru", "max.ru", "dzen.ru",
-        "rutube.ru", "avito.ru", "2gis.ru", "kinopoisk.ru", "sberbank.ru",
-        "tbank.ru", "rzd.ru", "nalog.ru", "mchs.gov.ru", "minzdrav.gov.ru",
-        "edu.gov.ru", "mos.ru", "spb.ru",
-    ]
+    domains_direct = ["vk.com", "yandex.ru", "mail.ru", "ok.ru", "gosuslugi.ru",
+                      "kremlin.ru", "ozon.ru", "wildberries.ru", "vseinstrumenti.ru",
+                      "max.ru", "dzen.ru", "rutube.ru", "avito.ru", "2gis.ru",
+                      "kinopoisk.ru", "sberbank.ru", "tbank.ru", "rzd.ru",
+                      "nalog.ru", "mchs.gov.ru", "minzdrav.gov.ru", "edu.gov.ru",
+                      "mos.ru", "spb.ru"]
 
     return {
-        "remarks": remarks,
-        "_cluster": cluster,
+        "remarks": remarks, "_cluster": cluster,
         "log": {"loglevel": "warning"},
         "dns": {"queryStrategy": "UseIP",
                 "servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]},
@@ -1742,8 +1713,7 @@ def _build_country_config(cc, cn, servers, cluster="regular",
         ],
         "outbounds": outbounds,
         "routing": {
-            "domainMatcher": "hybrid",
-            "domainStrategy": "IPIfNonMatch",
+            "domainMatcher": "hybrid", "domainStrategy": "IPIfNonMatch",
             "rules": [
                 {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
                 {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
@@ -1753,10 +1723,8 @@ def _build_country_config(cc, cn, servers, cluster="regular",
             "balancers": [balancer],
         },
         "burstObservatory": {
-            "pingConfig": {
-                "timeout": "10s", "interval": "120s", "sampling": 5,
-                "destination": "http://www.gstatic.com/generate_204",
-            },
+            "pingConfig": {"timeout": "10s", "interval": "120s", "sampling": 5,
+                           "destination": "http://www.gstatic.com/generate_204"},
             "subjectSelector": tags,
         },
     }
@@ -1786,6 +1754,16 @@ class OutputWriter:
     def write_unworking_all(self, proxies):
         self._write_list(self.unworking / "all.txt", proxies)
 
+    def write_blacklisted(self, items):
+        lines = []
+        for it in items:
+            p = Proxy(raw=it.get("raw", ""), kind=it.get("kind", ""),
+                      params=it.get("params") or {}, name=it.get("name", ""))
+            if p.params.get("server"):
+                lines.append(f"# fails={it.get('fail_count',0)}  last={it.get('last_checked','')}")
+                lines.append(dump_to_uri(p))
+        self._write_lines(self.unworking / "blacklisted.txt", lines)
+
     def write_speeds(self, lines):
         self._write_lines(self.allworking / "speeds.txt", lines)
 
@@ -1794,34 +1772,28 @@ class OutputWriter:
         snap = self.allworking / f"all_{ts}.txt"
         self._write_lines(snap, lines)
         latest = self.allworking / "latest.txt"
-        try:
-            shutil.copyfile(snap, latest)
-        except Exception:
-            self._write_lines(latest, lines)
+        try: shutil.copyfile(snap, latest)
+        except Exception: self._write_lines(latest, lines)
         return snap, latest
 
     def write_latest_json(self, cache, stable_cfg=None, new_cfg=None):
         order = {"stable": 0, "new": 1, "regular": 2}
         groups = defaultdict(list)
         for v in cache.items.values():
-            if v.get("status") != "working":
-                continue
-            if not (v.get("params") or {}).get("server"):
-                continue
+            if v.get("status") != "working": continue
+            if not (v.get("params") or {}).get("server"): continue
             cc = v.get("country_code") or ""
             cluster = cache.classify(v, stable_cfg, new_cfg)
-            groups[(cc, cluster)].append(
-                (cache.to_proxy(v), {"latency": v.get("latency")}))
+            groups[(cc, cluster)].append((cache.to_proxy(v), {"latency": v.get("latency")}))
 
         configs = []
         for cc, cluster in sorted(groups.keys(),
                                   key=lambda k: (k[0], order.get(k[1], 3))):
             rows = groups[(cc, cluster)]
-            if not rows:
-                continue
-            cfg = _build_country_config(
-                cc, country_ru(cc), rows,
-                cluster=cluster, stable_cfg=stable_cfg, new_cfg=new_cfg)
+            if not rows: continue
+            cfg = _build_country_config(cc, country_ru(cc), rows,
+                                        cluster=cluster, stable_cfg=stable_cfg,
+                                        new_cfg=new_cfg)
             cfg["_counts"] = {"cluster": cluster, "total": len(rows)}
             configs.append(cfg)
 
@@ -1830,10 +1802,8 @@ class OutputWriter:
                           encoding="utf-8")
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         snap = self.allworking / f"all_{ts}.json"
-        try:
-            shutil.copyfile(latest, snap)
-        except Exception:
-            snap.write_text(json.dumps(configs), encoding="utf-8")
+        try: shutil.copyfile(latest, snap)
+        except Exception: snap.write_text(json.dumps(configs), encoding="utf-8")
         return latest, snap
 
     def _write_cluster_bundle(self, name, cache, proxies, cluster,
@@ -1859,10 +1829,8 @@ class OutputWriter:
                            encoding="utf-8")
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         snap = self.allworking / f"{name}_{ts}.json"
-        try:
-            shutil.copyfile(js_path, snap)
-        except Exception:
-            snap.write_text(json.dumps(configs), encoding="utf-8")
+        try: shutil.copyfile(js_path, snap)
+        except Exception: snap.write_text(json.dumps(configs), encoding="utf-8")
         return {"txt": txt_path, "json": js_path, "snap": snap}
 
     def write_stable(self, cache, proxies, stable_cfg=None, new_cfg=None):
@@ -1886,12 +1854,10 @@ class OutputWriter:
         if path.exists():
             for line in path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
-                if line and not line.startswith("#"):
-                    ex.add(line)
+                if line and not line.startswith("#"): ex.add(line)
         for p in new_proxies:
             u = dump_to_uri(p)
-            if u:
-                ex.add(u)
+            if u: ex.add(u)
         path.write_text("\n".join(sorted(ex)) + "\n" if ex else "", encoding="utf-8")
 
 def _named_lines(cache, proxies, stable_cfg=None, new_cfg=None):
@@ -1905,6 +1871,9 @@ def _named_lines(cache, proxies, stable_cfg=None, new_cfg=None):
         lines.append(dump_to_uri(p, override_name=f"{prefix}{flag}{i}| @XelaraVpn"))
     return lines
 
+# ============================================================================
+# Параллельная проверка с батчингом
+# ============================================================================
 def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                     concurrency, server_timeout=SERVER_TIMEOUT_DEFAULT,
                     speed_test=True, speed_timeout=5.0,
@@ -1915,19 +1884,15 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
     results = {k: [] for k in ifaces}
 
     if double_check and discard_failed and discard_log:
-        try:
-            Path(discard_log).write_text("", encoding="utf-8")
-        except Exception:
-            pass
+        try: Path(discard_log).write_text("", encoding="utf-8")
+        except Exception: pass
 
     total = len(proxies)
-    if total == 0:
-        return results
+    if total == 0: return results
 
     n_batches = (total + max_batch - 1) // max_batch
     if n_batches > 1:
-        print(f"\n[i] {total} серверов разбиты на {n_batches} батчей "
-              f"по ≤ {max_batch}")
+        print(f"\n[i] {total} серверов → {n_batches} батчей по ≤ {max_batch}")
     t_all_start = time.time()
 
     for batch_idx in range(n_batches):
@@ -1938,8 +1903,7 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
 
         if n_batches > 1:
             print(f"\n{'═'*70}")
-            print(f"[i] БАТЧ {batch_idx + 1}/{n_batches} "
-                  f"— серверы {start + 1}…{end} из {total}")
+            print(f"[i] БАТЧ {batch_idx + 1}/{n_batches} — серверы {start + 1}…{end} из {total}")
             print(f"{'═'*70}")
 
         for iface_key, iface_name in ifaces.items():
@@ -1947,23 +1911,20 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
             if iface_name:
                 send_through = _get_iface_ip(iface_name)
                 if not send_through:
-                    print(f"[!] интерфейс '{iface_name}' не найден — пропускаю")
+                    print(f"[!] интерфейс '{iface_name}' не найден")
                     continue
 
             def _run_batch(sub_batch, pass_label):
-                if not sub_batch:
-                    return []
+                if not sub_batch: return []
                 pairs = []
                 lock = threading.Lock()
-                done = [0]
-                tot = len(sub_batch)
+                done = [0]; tot = len(sub_batch)
                 print_lock = threading.Lock()
 
                 def _w(pr):
                     prior = ""
                     it = cache.items.get(pr.dedup_key(), {})
-                    if it and it.get("country_code"):
-                        prior = it["country_code"]
+                    if it and it.get("country_code"): prior = it["country_code"]
                     r = check_proxy(pr, xray, timeout, send_through,
                                     prior_cc=prior, server_timeout=server_timeout,
                                     speed_test=speed_test, speed_timeout=speed_timeout,
@@ -1971,13 +1932,11 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                                     require_upload=require_upload)
                     cache.upsert(pr, r, sub_index)
                     with lock:
-                        pairs.append((pr, r))
-                        done[0] += 1
+                        pairs.append((pr, r)); done[0] += 1
                         n = done[0]
                     label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
                     with print_lock:
-                        dn = r.get("download_mbps")
-                        up = r.get("upload_mbps")
+                        dn = r.get("download_mbps"); up = r.get("upload_mbps")
                         sp_s = ""
                         if dn is not None or up is not None:
                             sp_s = (f" ↓{dn if dn is not None else '—'}Mbps "
@@ -1990,12 +1949,12 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                             el = r.get("elapsed")
                             el_s = f" {el}s" if el is not None else ""
                             print(f"  {pass_label} [{n}/{tot}] OK {flag} {cn} {r['latency']}ms "
-                                  f"{ka_s}{sp_s}{el_s} ip={r['ip']} | {label}")
+                                  f"{ka_s}{sp_s}{el_s} ip={r['ip']} | {label}", flush=True)
                         else:
                             el = r.get("elapsed")
                             el_s = f" {el}s" if el is not None else ""
                             print(f"  {pass_label} [{n}/{tot}] FAIL{sp_s}{el_s} "
-                                  f"{r['error']} | {label}")
+                                  f"{r['error']} | {label}", flush=True)
 
                 with cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
                     list(ex.map(_w, sub_batch))
@@ -2006,33 +1965,22 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
             failed = [pr for pr, r in first_pairs if not r["ok"]]
 
             if double_check and failed:
-                print(f"\n  ⟳ Двойная проверка: {len(failed)} серверов без ответа, "
-                      f"ставлю в конец очереди...")
+                print(f"\n  ⟳ Двойная проверка: {len(failed)} серверов...")
                 retry_pairs = _run_batch(failed, "2nd")
                 success_retry = [(pr, r) for pr, r in retry_pairs if r["ok"]]
                 still_failed  = [(pr, r) for pr, r in retry_pairs if not r["ok"]]
-
                 final_pairs.extend(success_retry)
-
                 if still_failed:
-                    print(f"\n  ✗ После второй проверки не ответили: {len(still_failed)}")
                     if discard_failed:
                         for pr, r in still_failed:
-                            key = pr.dedup_key()
-                            cache.items.pop(key, None)
-                            label = pr.name or f"{pr.kind}://{pr.params.get('server')}"
-                            err = r.get("error") or "timeout"
-                            print(f"    ✗ выброшен: {label} ({err})")
+                            cache.items.pop(pr.dedup_key(), None)
                             if discard_log:
                                 try:
                                     with open(discard_log, "a", encoding="utf-8") as f:
-                                        f.write(f"{pr.raw or label}\t{err}\n")
-                                except Exception:
-                                    pass
+                                        f.write(f"{pr.raw or pr.name}\t{r.get('error') or 'timeout'}\n")
+                                except Exception: pass
                     else:
                         final_pairs.extend(still_failed)
-                else:
-                    print(f"\n  ✓ После второй проверки восстановились: {len(success_retry)}")
             elif failed and not double_check:
                 final_pairs.extend([(pr, r) for pr, r in first_pairs if not r["ok"]])
 
@@ -2047,17 +1995,19 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                 print(f"\n[i] батч {batch_idx + 1}/{n_batches} за {dt_batch:.0f}s, "
                       f"кэш сохранён. ETA ~{eta/60:.0f} мин")
             except Exception as e:
-                print(f"[!] не удалось сохранить кэш: {e}")
+                print(f"[!] кэш не сохранён: {e}")
 
     return results
 
+# ============================================================================
+# Финальная запись
+# ============================================================================
 def _write_final(cache, writer, sources_count, final_file="working.txt",
                  stable_cfg=None, new_cfg=None):
     print(f"\n[i] кэш сохранён: {len(cache.items)} записей")
 
     new_window = (new_cfg.get("recent_hours", 24.0)
                   if new_cfg and new_cfg.get("enabled", True) else None)
-
     new_proxies = []
     if new_window is not None:
         new_proxies = cache.new_all(recent_hours=new_window)
@@ -2067,8 +2017,7 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
     if stable_cfg and stable_cfg.get("enabled", True):
         stable_proxies = [
             p for p in cache.stable_all(
-                min_checks=stable_cfg["min_checks"],
-                min_rate=stable_cfg["min_rate"],
+                min_checks=stable_cfg["min_checks"], min_rate=stable_cfg["min_rate"],
                 min_consecutive=stable_cfg["min_consecutive"],
                 recent_hours=stable_cfg["recent_hours"])
             if new_window is None or p.dedup_key() not in new_keys
@@ -2084,28 +2033,33 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
     lines_all = _named_lines(cache, all_working, stable_cfg, new_cfg)
     writer.write_working_all(lines_all)
     print(f"[i] Working/all.txt: {len(all_working)} рабочих "
-          f"(⚡ stable: {len(stable_proxies)}, 🟢 new: {len(new_proxies)})")
+          f"(⚡ {len(stable_proxies)}, 🟢 {len(new_proxies)})")
 
     speed_lines = []
     for v in cache.items.values():
-        if v.get("status") != "working":
-            continue
+        if v.get("status") != "working": continue
         dn = v.get("download_mbps"); up = v.get("upload_mbps")
-        if dn is None and up is None:
-            continue
+        if dn is None and up is None: continue
         p = cache.to_proxy(v)
         cluster = cache.classify(v, stable_cfg, new_cfg)
         mark = marker_for(cluster, stable_cfg, new_cfg)
         pref = f"{mark} " if mark else ""
-        speed_lines.append(
-            f"{pref}↓{dn}Mbps\t↑{up}Mbps\t{v.get('latency')}ms\t{dump_to_uri(p)}")
+        speed_lines.append(f"{pref}↓{dn}Mbps\t↑{up}Mbps\t{v.get('latency')}ms\t{dump_to_uri(p)}")
     if speed_lines:
         writer.write_speeds(speed_lines)
-        print(f"[i] AllWorking/speeds.txt: {len(speed_lines)} строк")
+        print(f"[i] speeds.txt: {len(speed_lines)} строк")
 
     all_unworking = cache.unworking_all()
     writer.write_unworking_all(all_unworking)
-    print(f"[i] UnWorking/all.txt: {len(all_unworking)} нерабочих")
+
+    _blacklisted = cache.blacklisted_items()
+    if _blacklisted:
+        writer.write_blacklisted(_blacklisted)
+        print(f"[i] UnWorking/all.txt: {len(all_unworking)} нерабочих "
+              f"(из них {len(_blacklisted)} в блэклисте)")
+        print(f"[i] UnWorking/blacklisted.txt: {len(_blacklisted)} серверов")
+    else:
+        print(f"[i] UnWorking/all.txt: {len(all_unworking)} нерабочих")
 
     snap_txt, _ = writer.write_versioned_all_working(lines_all)
     print(f"[i] AllWorking/{snap_txt.name} ({len(all_working)} рабочих)")
@@ -2113,24 +2067,20 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
     try:
         latest_json, snap_json = writer.write_latest_json(cache, stable_cfg, new_cfg)
         print(f"[i] AllWorking/{latest_json.name}")
-        print(f"[i] AllWorking/{snap_json.name}")
     except Exception as e:
         print(f"[!] latest.json ошибка: {e}")
 
     if stable_proxies:
         try:
             paths = writer.write_stable(cache, stable_proxies, stable_cfg, new_cfg)
-            print(f"[i] AllWorking/{paths['txt'].name}: {len(stable_proxies)} ⚡")
-            print(f"[i] AllWorking/{paths['json'].name}")
-            print(f"[i] AllWorking/{paths['snap'].name}")
+            print(f"[i] stable.txt: {len(stable_proxies)} ⚡")
         except Exception as e:
             print(f"[!] stable ошибка: {e}")
 
     if new_proxies and new_cfg and new_cfg.get("output", True):
         try:
             paths = writer.write_new(cache, new_proxies, stable_cfg, new_cfg)
-            print(f"[i] AllWorking/{paths['txt'].name}: {len(new_proxies)} 🟢")
-            print(f"[i] AllWorking/{paths['json'].name}")
+            print(f"[i] new.txt: {len(new_proxies)} 🟢")
         except Exception as e:
             print(f"[!] new ошибка: {e}")
 
@@ -2140,22 +2090,23 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
             encoding="utf-8")
         print(f"[i] {final_file}: {len(all_working)} рабочих")
     except Exception as e:
-        print(f"[!] не удалось записать {final_file}: {e}")
+        print(f"[!] {final_file}: {e}")
 
 def _collect_proxies_from_uris(uris):
     out = []
     for u in uris:
         u = u.strip()
-        if not u or u.startswith("#"):
-            continue
+        if not u or u.startswith("#"): continue
         p = parse_uri(u)
-        if p and p.params.get("server"):
-            out.append(p)
+        if p and p.params.get("server"): out.append(p)
     return out
 
+# ============================================================================
+# main
+# ============================================================================
 def main():
     ap = argparse.ArgumentParser(
-        description="Combined Source Loader + Xray Checker (batched, double-check optional)")
+        description="Combined Source Loader + Xray Checker (batched, blacklist, split cache)")
     ap.add_argument("--no-load", action="store_true")
     ap.add_argument("-i", "--input", default=CONFIGS_FILE)
     ap.add_argument("-o", "--output-dir", default="output")
@@ -2170,44 +2121,41 @@ def main():
     ap.add_argument("--recheck-files",
                     default="working.txt,output/AllWorking/latest.txt,output/AllWorking/latest.json")
     ap.add_argument("--no-recheck-final", action="store_true")
-
     ap.add_argument("--no-double-check", action="store_true")
     ap.add_argument("--keep-failed", action="store_true")
     ap.add_argument("--discard-log", default=DISCARD_FILE)
-
+    ap.add_argument("--include-blacklisted", action="store_true",
+                    help=f"не пропускать серверы с fail_count >= {BLACKLIST_FAIL_THRESHOLD}")
+    ap.add_argument("--reset-blacklist", action="store_true",
+                    help="сбросить fail_count у всех серверов")
     ap.add_argument("--no-speed", action="store_true")
     ap.add_argument("--speed-timeout", type=float, default=5.0)
     ap.add_argument("--min-down", type=float, default=0.05)
     ap.add_argument("--min-up", type=float, default=0.02)
     ap.add_argument("--no-upload-check", action="store_true")
-
     ap.add_argument("--no-stable", action="store_true")
     ap.add_argument("--stable-min-checks", type=int, default=3)
     ap.add_argument("--stable-min-rate", type=float, default=0.8)
     ap.add_argument("--stable-min-consecutive", type=int, default=2)
     ap.add_argument("--stable-recent-hours", type=float, default=72.0)
     ap.add_argument("--stable-marker", default="⚡")
-
     ap.add_argument("--no-new-marker", action="store_true")
     ap.add_argument("--new-marker", default="🟢")
     ap.add_argument("--new-recent-hours", type=float, default=24.0)
     ap.add_argument("--no-new-output", action="store_true")
-
-    ap.add_argument("--max-batch", type=int, default=MAX_BATCH_SIZE,
-                    help=f"макс. серверов за один батч (default: {MAX_BATCH_SIZE})")
+    ap.add_argument("--max-batch", type=int, default=MAX_BATCH_SIZE)
 
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
     mode.add_argument("--only-old", action="store_true")
     args = ap.parse_args()
 
-    if args.concurrency < 1:
-        args.concurrency = 1
+    if args.concurrency < 1: args.concurrency = 1
     if args.concurrency > MAX_CONCURRENCY:
-        print(f"[!] -c {args.concurrency} слишком много, ставлю {MAX_CONCURRENCY}")
+        print(f"[!] -c {args.concurrency} → {MAX_CONCURRENCY}")
         args.concurrency = MAX_CONCURRENCY
     if args.max_batch < 100:
-        print(f"[!] --max-batch={args.max_batch} слишком мало, ставлю 100")
+        print(f"[!] --max-batch={args.max_batch} → 100")
         args.max_batch = 100
 
     check_kwargs = dict(
@@ -2260,18 +2208,19 @@ def main():
                 if l.strip() and not l.strip().startswith("#")]
 
     print(f"\n[i] режим: {'only-new' if args.only_new else 'only-old' if args.only_old else 'all'}")
-    print(f"[i] источников (URL): {len(sources)}")
-    print(f"[i] параллельно: {args.concurrency} | бюджет на сервер: {args.server_timeout}s")
-    print(f"[i] батч: ≤{args.max_batch} серверов за проход")
-    print(f"[i] двойная проверка: {'ВКЛ' if check_kwargs['double_check'] else 'ВЫКЛ'} "
-          f"| выбрасывать после 2 фейлов: {'ДА' if check_kwargs['discard_failed'] else 'НЕТ'}")
-    print(f"[i] скорость: {'ВКЛ' if check_kwargs['speed_test'] else 'ВЫКЛ'} "
-          f"(↓{args.min_down} / ↑{args.min_up} Mbps, таймаут {args.speed_timeout}s)")
+    print(f"[i] источников: {len(sources)}")
+    print(f"[i] параллельно: {args.concurrency} | бюджет: {args.server_timeout}s")
+    print(f"[i] батч: ≤{args.max_batch}")
+    print(f"[i] двойная: {'ВКЛ' if check_kwargs['double_check'] else 'ВЫКЛ'} "
+          f"| выбрасывать: {'ДА' if check_kwargs['discard_failed'] else 'НЕТ'}")
+    print(f"[i] скорость: {'ВКЛ' if check_kwargs['speed_test'] else 'ВЫКЛ'}")
     print(f"[i] стабильные: {'ВКЛ' if stable_cfg['enabled'] else 'ВЫКЛ'} "
-          f"(метка {stable_cfg['marker']})")
-    print(f"[i] новые: {'ВКЛ' if new_cfg['enabled'] else 'ВЫКЛ'} "
-          f"(метка {new_cfg['marker']}, first_seen<{new_cfg['recent_hours']}ч)")
+          f"| новые: {'ВКЛ' if new_cfg['enabled'] else 'ВЫКЛ'}")
     print(f"[i] в кэше: {len(cache.items)} записей")
+    _bl_count = len(cache.blacklisted_keys())
+    if _bl_count:
+        print(f"[i] в блэклисте: {_bl_count} серверов (fail_count >= {BLACKLIST_FAIL_THRESHOLD})")
+    print(f"[i] порог разбиения кэша: {CACHE_SPLIT_THRESHOLD_MB} MB")
 
     xray = XrayManager(args.xray_dir)
     try:
@@ -2295,38 +2244,63 @@ def main():
             if line and not line.startswith("#"):
                 file_uris.append(line)
 
-    all_uris = file_uris + extra_uris_from_loader
+    if extra_uris_from_loader:
+        all_uris = extra_uris_from_loader
+    else:
+        all_uris = file_uris
 
     if not all_uris and sources and (args.only_old or args.no_load):
         for s in sources:
             p = parse_uri(s)
-            if p:
-                all_uris.append(s)
+            if p: all_uris.append(s)
 
     proxies = _collect_proxies_from_uris(all_uris)
     print(f"[i] распарсено URI: {len(all_uris)} → валидных Proxy: {len(proxies)}")
+
+    if args.reset_blacklist:
+        _n = 0
+        for _v in cache.items.values():
+            if int(_v.get("fail_count", 0)) > 0:
+                _v["fail_count"] = 0
+                _n += 1
+        print(f"[i] blacklist сброшен у {_n} серверов")
+        cache.save()
+
+    if not args.include_blacklisted:
+        _bl = cache.blacklisted_keys()
+        if _bl:
+            _before = len(proxies)
+            proxies = [p for p in proxies if p.dedup_key() not in _bl]
+            _skipped = _before - len(proxies)
+            if _skipped:
+                print(f"[i] пропущено блэклистнутых: {_skipped}")
 
     prev_final_proxies = []
     if not args.no_recheck_final and not args.only_new:
         paths = [s.strip() for s in args.recheck_files.split(",") if s.strip()]
         print(f"[i] recheck-files: {paths}")
         prev_final_proxies = _load_recheck_files(paths)
+        if prev_final_proxies and not args.include_blacklisted:
+            _bl = cache.blacklisted_keys()
+            prev_final_proxies = [p for p in prev_final_proxies if p.dedup_key() not in _bl]
         if prev_final_proxies:
-            print(f"[i] всего для перепроверки из файлов: {len(prev_final_proxies)}")
+            print(f"[i] для перепроверки: {len(prev_final_proxies)}")
 
     if args.only_old:
         cached = []
         for it in cache.items.values():
+            if not args.include_blacklisted and cache.is_blacklisted(it): continue
             p = cache.to_proxy(it)
-            if p and p.params.get("server"):
-                cached.append(p)
+            if p and p.params.get("server"): cached.append(p)
         cached.extend(prev_final_proxies)
+        if not args.include_blacklisted:
+            _bl = cache.blacklisted_keys()
+            cached = [p for p in cached if p.dedup_key() not in _bl]
         uniq = _dedup(cached)
         print(f"[i] перепроверяю старые: {len(uniq)}")
         if uniq:
-            _check_parallel(uniq, xray, args.timeout, ifaces, cache,
-                            sub_index=0, concurrency=args.concurrency,
-                            **check_kwargs)
+            _check_parallel(uniq, xray, args.timeout, ifaces, cache, sub_index=0,
+                            concurrency=args.concurrency, **check_kwargs)
         cache.save()
         _write_final(cache, writer, 0, args.final_file,
                      stable_cfg=stable_cfg, new_cfg=new_cfg)
@@ -2334,12 +2308,13 @@ def main():
 
     if args.only_new:
         known = set(cache.items.keys())
+        if args.include_blacklisted:
+            known -= cache.blacklisted_keys()
         new_only = [p for p in proxies if p.dedup_key() not in known]
         print(f"[i] only-new: всего {len(proxies)}, новых {len(new_only)}")
         if new_only:
-            _check_parallel(new_only, xray, args.timeout, ifaces, cache,
-                            sub_index=1, concurrency=args.concurrency,
-                            **check_kwargs)
+            _check_parallel(new_only, xray, args.timeout, ifaces, cache, sub_index=1,
+                            concurrency=args.concurrency, **check_kwargs)
         cache.save()
         _write_final(cache, writer, len(sources) or 1, args.final_file,
                      stable_cfg=stable_cfg, new_cfg=new_cfg)
@@ -2347,17 +2322,12 @@ def main():
 
     uniq = _dedup(proxies)
     if uniq:
-        print(f"\n{'='*70}")
-        print(f"=== Проверка {len(uniq)} серверов")
-        print(f"{'='*70}")
-        _check_parallel(uniq, xray, args.timeout, ifaces, cache,
-                        sub_index=1, concurrency=args.concurrency,
-                        **check_kwargs)
+        print(f"\n{'='*70}\n=== Проверка {len(uniq)} серверов\n{'='*70}")
+        _check_parallel(uniq, xray, args.timeout, ifaces, cache, sub_index=1,
+                        concurrency=args.concurrency, **check_kwargs)
 
     if prev_final_proxies:
-        print(f"\n{'='*70}")
-        print(f"=== Перепроверка файлов: {len(prev_final_proxies)} серверов")
-        print(f"{'='*70}")
+        print(f"\n{'='*70}\n=== Перепроверка файлов: {len(prev_final_proxies)}\n{'='*70}")
         uniq_re = _dedup(prev_final_proxies)
         results = _check_parallel(uniq_re, xray, args.timeout, ifaces, cache,
                                   sub_index=999, concurrency=args.concurrency,
