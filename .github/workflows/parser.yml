@@ -5,8 +5,64 @@ on:
     - cron: '0 */3 * * *'
   workflow_dispatch:
     inputs:
-      only_new:
-        description: 'Только новые серверы (--only-new)'
+      mode:
+        description: 'Режим проверки'
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - only-new
+          - only-old
+
+      concurrency:
+        description: 'Параллельных потоков (-c)'
+        type: choice
+        default: '32'
+        options:
+          - '16'
+          - '32'
+          - '48'
+          - '64'
+          - '96'
+
+      timeout:
+        description: 'Таймаут на запрос, сек (--timeout / --server-timeout)'
+        type: choice
+        default: '10'
+        options:
+          - '8'
+          - '10'
+          - '15'
+          - '20'
+          - '30'
+
+      max_batch:
+        description: 'Размер батча (--max-batch)'
+        type: choice
+        default: '3000'
+        options:
+          - '1000'
+          - '3000'
+          - '5000'
+          - '10000'
+
+      reset_blacklist:
+        description: 'Сбросить fail_count у всех серверов'
+        type: boolean
+        default: false
+
+      include_blacklisted:
+        description: 'Проверять даже серверы из блэклиста (fail>=3)'
+        type: boolean
+        default: false
+
+      with_speed:
+        description: 'Мерить скорость download/upload (медленно!)'
+        type: boolean
+        default: false
+
+      double_check:
+        description: 'Перепроверять упавших (2-й проход)'
         type: boolean
         default: false
 
@@ -17,6 +73,9 @@ jobs:
   check-and-sync:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    concurrency:
+      group: xelara-check
+      cancel-in-progress: false
     env:
       PYTHONUNBUFFERED: "1"
 
@@ -40,7 +99,7 @@ jobs:
           path: xray_bin
           key: xray-${{ runner.os }}-v1
 
-      - name: 📦 Restore Xelara cache (single file OR parts)
+      - name: 📦 Restore Xelara cache
         uses: actions/cache@v4
         with:
           path: |
@@ -50,7 +109,7 @@ jobs:
           restore-keys: |
             xelara-cache-
 
-      - name: ⬇️ Pre-download Xray (curl, with retry)
+      - name: ⬇️ Pre-download Xray
         run: |
           mkdir -p xray_bin
           if [ ! -x xray_bin/xray ]; then
@@ -63,25 +122,62 @@ jobs:
           fi
           ./xray_bin/xray version
 
-      - name: 🚀 Run Xelara Checker (all)
-        if: ${{ github.event.inputs.only_new != 'true' }}
+      - name: 🧮 Build argument list
+        id: args
+        env:
+          IN_MODE:              ${{ github.event.inputs.mode }}
+          IN_CONCURRENCY:       ${{ github.event.inputs.concurrency }}
+          IN_TIMEOUT:           ${{ github.event.inputs.timeout }}
+          IN_MAX_BATCH:         ${{ github.event.inputs.max_batch }}
+          IN_RESET_BLACKLIST:   ${{ github.event.inputs.reset_blacklist }}
+          IN_INCLUDE_BLACKLIST: ${{ github.event.inputs.include_blacklisted }}
+          IN_WITH_SPEED:        ${{ github.event.inputs.with_speed }}
+          IN_DOUBLE_CHECK:      ${{ github.event.inputs.double_check }}
         run: |
-          python xelara.py \
-            -c 32 --timeout 15 --server-timeout 15 --max-batch 10000 \
-            --no-double-check
+          # Дефолты для cron-запуска (когда inputs пустые)
+          MODE="${IN_MODE:-all}"
+          CONC="${IN_CONCURRENCY:-32}"
+          TMO="${IN_TIMEOUT:-10}"
+          BATCH="${IN_MAX_BATCH:-3000}"
+          RESET="${IN_RESET_BLACKLIST:-false}"
+          INCL="${IN_INCLUDE_BLACKLIST:-false}"
+          SPEED="${IN_WITH_SPEED:-false}"
+          DBL="${IN_DOUBLE_CHECK:-false}"
 
-      - name: 🚀 Run Xelara Checker (only-new)
-        if: ${{ github.event.inputs.only_new == 'true' }}
+          ARGS="-c ${CONC} --timeout ${TMO} --server-timeout ${TMO} --max-batch ${BATCH}"
+
+          case "$MODE" in
+            only-new) ARGS="$ARGS --only-new" ;;
+            only-old) ARGS="$ARGS --only-old" ;;
+            all|'')   ;;
+            *) echo "::error::unknown mode $MODE"; exit 1 ;;
+          esac
+
+          [ "$RESET" = "true" ] && ARGS="$ARGS --reset-blacklist"
+          [ "$INCL"  = "true" ] && ARGS="$ARGS --include-blacklisted"
+          [ "$SPEED" != "true" ] && ARGS="$ARGS --no-speed --no-upload-check"
+          [ "$DBL"   != "true" ] && ARGS="$ARGS --no-double-check"
+
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "[i] mode=${MODE} conc=${CONC} timeout=${TMO} batch=${BATCH}"
+          echo "[i] reset=${RESET} include_bl=${INCL} speed=${SPEED} dbl=${DBL}"
+          echo "[i] final args: $ARGS"
+
+      - name: 🚀 Run Xelara Checker
         run: |
-          python xelara.py --only-new \
-            -c 32 --timeout 10 --server-timeout 10 --max-batch 10000 \
-            --no-double-check --no-speed --no-upload-check
+          python xelara.py ${{ steps.args.outputs.args }}
 
       - name: 💾 Commit and Push Results
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "🤖 Auto-update configs [skip ci]"
-          file_pattern: "output/AllWorking/latest.json output/AllWorking/latest.txt working.txt sources.txt blacklist_sources.txt"
+          file_pattern: >-
+            output/AllWorking/latest.json
+            output/AllWorking/latest.txt
+            working.txt
+            output/UnWorking/blacklisted.txt
+            sources.txt
+            blacklist_sources.txt
           commit_user_name: "Xelara Bot"
           commit_user_email: "bot@xelara.local"
 
