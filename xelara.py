@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Combined Source Loader + Xray Parser & Checker
-v-dbl + v-speed + v-stable + v-new + blacklist + batched + split-cache
+v-dbl + v-speed + v-stable + v-new + blacklist + batched + split-cache + top-fastest
 """
 
 import importlib, subprocess, sys
@@ -91,6 +91,7 @@ MAX_BATCH_SIZE  = 10_000
 MAX_CONCURRENCY = 256
 
 BLACKLIST_FAIL_THRESHOLD = 3
+TOP_FASTEST_COUNT        = 150
 
 CACHE_SPLIT_THRESHOLD_MB    = 50
 CACHE_SPLIT_THRESHOLD_BYTES = CACHE_SPLIT_THRESHOLD_MB * 1024 * 1024
@@ -739,7 +740,6 @@ async def load_http_sources():
 
     all_configs = stats['all_configs'] + my_configs
     if all_configs:
-        # Перезаписываем, а не дописываем — фикс раздувания
         async with aiofiles.open(CONFIGS_FILE, 'w', encoding='utf-8') as f:
             for cfg in all_configs:
                 await f.write(cfg + '\n')
@@ -1767,6 +1767,58 @@ class OutputWriter:
     def write_speeds(self, lines):
         self._write_lines(self.allworking / "speeds.txt", lines)
 
+    def write_top_fastest(self, cache, count=TOP_FASTEST_COUNT):
+        """
+        Top-N самых быстрых серверов.
+        Сортировка: download_mbps desc, tiebreak latency asc.
+        Серверы без замеренной скорости (--no-speed) идут во второй эшелон
+        и сортируются по пингу.
+        Возвращает (Path, list) или None если данных нет.
+        """
+        rows = []
+        for v in cache.items.values():
+            if v.get("status") != "working":
+                continue
+            if not (v.get("params") or {}).get("server"):
+                continue
+            dn = v.get("download_mbps")
+            lat = v.get("latency")
+            if dn is None and lat is None:
+                continue
+            rows.append(v)
+        if not rows:
+            return None
+
+        def sort_key(v):
+            dn = v.get("download_mbps")
+            lat = v.get("latency")
+            if lat is None:
+                lat = 999999
+            if dn is not None:
+                return (0, -dn, lat)
+            return (1, 0, lat)
+
+        rows.sort(key=sort_key)
+        top = rows[:count]
+
+        lines = []
+        for i, v in enumerate(top, 1):
+            p = cache.to_proxy(v)
+            flag = resolve_flag(v)
+            dn = v.get("download_mbps")
+            up = v.get("upload_mbps")
+            lat = v.get("latency")
+            parts = []
+            if dn is not None: parts.append(f"↓{dn}Mbps")
+            if up is not None: parts.append(f"↑{up}Mbps")
+            if lat is not None: parts.append(f"{lat}ms")
+            stats = " ".join(parts) if parts else "no-stats"
+            lines.append(dump_to_uri(p, override_name=f"{flag}{i} | {stats}"))
+
+        path = self.allworking / "top150.txt"
+        self._write_lines(path, lines)
+        return path, top
+
     def write_versioned_all_working(self, lines):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         snap = self.allworking / f"all_{ts}.txt"
@@ -2003,7 +2055,8 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
 # Финальная запись
 # ============================================================================
 def _write_final(cache, writer, sources_count, final_file="working.txt",
-                 stable_cfg=None, new_cfg=None):
+                 stable_cfg=None, new_cfg=None,
+                 top_fastest_count=TOP_FASTEST_COUNT):
     print(f"\n[i] кэш сохранён: {len(cache.items)} записей")
 
     new_window = (new_cfg.get("recent_hours", 24.0)
@@ -2048,6 +2101,27 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
     if speed_lines:
         writer.write_speeds(speed_lines)
         print(f"[i] speeds.txt: {len(speed_lines)} строк")
+
+    try:
+        result = writer.write_top_fastest(cache, top_fastest_count)
+        if result:
+            path, top = result
+            print(f"[i] AllWorking/{path.name}: {len(top)} серверов "
+                  f"(топ по скорости/пингу)")
+            for i, v in enumerate(top[:5], 1):
+                dn = v.get("download_mbps")
+                up = v.get("upload_mbps")
+                lat = v.get("latency")
+                flag = resolve_flag(v)
+                cc = country_ru(v.get("country_code", ""))
+                s_dn = f"↓{dn}Mbps" if dn is not None else "↓—"
+                s_up = f"↑{up}Mbps" if up is not None else "↑—"
+                s_lat = f"{lat}ms" if lat is not None else "?ms"
+                print(f"    #{i} {flag} {cc}: {s_dn} {s_up} {s_lat}")
+        else:
+            print("[i] top150.txt: нет данных (все серверы без скорости и пинга)")
+    except Exception as e:
+        print(f"[!] top150 ошибка: {e}")
 
     all_unworking = cache.unworking_all()
     writer.write_unworking_all(all_unworking)
@@ -2106,7 +2180,7 @@ def _collect_proxies_from_uris(uris):
 # ============================================================================
 def main():
     ap = argparse.ArgumentParser(
-        description="Combined Source Loader + Xray Checker (batched, blacklist, split cache)")
+        description="Combined Source Loader + Xray Checker (batched, blacklist, split cache, top-fastest)")
     ap.add_argument("--no-load", action="store_true")
     ap.add_argument("-i", "--input", default=CONFIGS_FILE)
     ap.add_argument("-o", "--output-dir", default="output")
@@ -2144,6 +2218,8 @@ def main():
     ap.add_argument("--new-recent-hours", type=float, default=24.0)
     ap.add_argument("--no-new-output", action="store_true")
     ap.add_argument("--max-batch", type=int, default=MAX_BATCH_SIZE)
+    ap.add_argument("--top-fastest", type=int, default=TOP_FASTEST_COUNT,
+                    help=f"сколько серверов в topN (default: {TOP_FASTEST_COUNT})")
 
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
@@ -2221,6 +2297,7 @@ def main():
     if _bl_count:
         print(f"[i] в блэклисте: {_bl_count} серверов (fail_count >= {BLACKLIST_FAIL_THRESHOLD})")
     print(f"[i] порог разбиения кэша: {CACHE_SPLIT_THRESHOLD_MB} MB")
+    print(f"[i] top-fastest: {args.top_fastest}")
 
     xray = XrayManager(args.xray_dir)
     try:
@@ -2303,7 +2380,8 @@ def main():
                             concurrency=args.concurrency, **check_kwargs)
         cache.save()
         _write_final(cache, writer, 0, args.final_file,
-                     stable_cfg=stable_cfg, new_cfg=new_cfg)
+                     stable_cfg=stable_cfg, new_cfg=new_cfg,
+                     top_fastest_count=args.top_fastest)
         return
 
     if args.only_new:
@@ -2317,7 +2395,8 @@ def main():
                             concurrency=args.concurrency, **check_kwargs)
         cache.save()
         _write_final(cache, writer, len(sources) or 1, args.final_file,
-                     stable_cfg=stable_cfg, new_cfg=new_cfg)
+                     stable_cfg=stable_cfg, new_cfg=new_cfg,
+                     top_fastest_count=args.top_fastest)
         return
 
     uniq = _dedup(proxies)
@@ -2340,7 +2419,8 @@ def main():
 
     cache.save()
     _write_final(cache, writer, max(len(sources), 1), args.final_file,
-                 stable_cfg=stable_cfg, new_cfg=new_cfg)
+                 stable_cfg=stable_cfg, new_cfg=new_cfg,
+                 top_fastest_count=args.top_fastest)
 
 if __name__ == "__main__":
     try:
