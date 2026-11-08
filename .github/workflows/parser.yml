@@ -147,6 +147,14 @@ jobs:
         run: |
           python xelara.py ${{ steps.args.outputs.args }}
 
+      - name: 🗂️ Ensure tracked output files exist
+        run: |
+          mkdir -p output/AllWorking output/UnWorking
+          touch output/UnWorking/blacklisted.txt
+          touch blacklist_sources.txt
+          touch sources.txt
+          touch working.txt
+
       - name: 💾 Commit and Push Results
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
