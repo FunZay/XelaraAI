@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Combined Source Loader + Xray Parser & Checker
-v-dbl + v-speed + v-stable + v-new + blacklist + batched + split-cache + top-fastest
-[ИСПРАВЛЕНО]: Структура JSON, дефолтный speed_test, надежные IP-сервисы (2ip.io), логика Каскада.
+[ИСПРАВЛЕНО]: Жесткий фоллбек на 🇪🇺 EU при любом непонятном IP/стране.
 """
 
 import importlib, subprocess, sys
@@ -108,7 +107,6 @@ SERVER_TIMEOUT_DEFAULT = 8.0
 
 TEST_URLS_FALLBACK = ["https://www.gstatic.com/generate_204"]
 
-# НАДЕЖНЫЕ СЕРВИСЫ ДЛЯ ОПРЕДЕЛЕНИЯ IP (Приоритет: 2ip.io, ipapi.co, ipify)
 IP_CHECK_URLS = [
     "https://2ip.io/json/",
     "https://ipapi.co/json/",
@@ -180,12 +178,10 @@ COUNTRY_RU = {
     "ME": "Черногория", "XK": "Косово",
 }
 
-def country_ru(cc, fallback=""):
+def country_ru(cc, fallback="EU"):
     if cc and cc in COUNTRY_RU:
         return COUNTRY_RU[cc]
-    if cc:
-        return fallback or cc
-    return "Европа"
+    return "EU"
 
 def clean_text(text: str) -> str:
     if not text:
@@ -214,15 +210,15 @@ def _safe_urlparse(uri):
 
 def flag_from_cc(cc):
     if not cc or len(cc) != 2:
-        return "🏳️"
+        return "🇪🇺" # ЖЕСТКИЙ ФОЛЛБЕК НА EU
     try:
         return "".join(chr(0x1F1E6 + ord(c.upper()) - ord('A')) for c in cc)
     except Exception:
-        return "🏳️"
+        return "🇪🇺"
 
 def resolve_flag(item):
     cc = (item or {}).get("country_code", "") or ""
-    return flag_from_cc(cc) if cc else "🏳️"
+    return flag_from_cc(cc)
 
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1048,7 +1044,7 @@ class Cache:
         return it.get("fail_count", 0) >= BLACKLIST_FAIL_THRESHOLD
 
 # ============================================================================
-# Проверка прокси (ИСПРАВЛЕНО: JSON, дефолты, умный IP/Каскад с 2ip.io)
+# Проверка прокси (ЖЕСТКИЙ ФОЛЛБЕК НА 🇪🇺 EU)
 # ============================================================================
 def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 prior_cc="", server_timeout=None,
@@ -1064,7 +1060,6 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
     if send_through:
         ob.setdefault("streamSettings", {}).setdefault("sockopt", {})["sendThrough"] = send_through
     
-    # ИСПРАВЛЕНИЕ: inbounds и outbounds вынесены на верхний уровень
     cfg = {
         "log": {"loglevel": "warning"},
         "dns": {
@@ -1100,8 +1095,8 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 pass
             return {"ok": False, "latency": None, "latency_keepalive": None,
                     "download_mbps": None, "upload_mbps": None,
-                    "ip": None, "country_code": "", "country": "",
-                    "inbound_ip": "", "exit_ip": "", "is_cascade": False, "cascade_msg": "",
+                    "ip": None, "country_code": "EU", "country": "EU",
+                    "inbound_ip": "", "exit_ip": "", "is_cascade": True, "cascade_msg": "Каскад 🇪🇺EU → 🇪🇺EU",
                     "test_url": None, "error": msg,
                     "elapsed": round(time.time() - t_start, 2)}
         
@@ -1133,8 +1128,8 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             session.close()
             return {"ok": False, "latency": None, "latency_keepalive": None,
                     "download_mbps": None, "upload_mbps": None,
-                    "ip": None, "country_code": "", "country": "",
-                    "inbound_ip": "", "exit_ip": "", "is_cascade": False, "cascade_msg": "",
+                    "ip": None, "country_code": "EU", "country": "EU",
+                    "inbound_ip": "", "exit_ip": "", "is_cascade": True, "cascade_msg": "Каскад 🇪🇺EU → 🇪🇺EU",
                     "test_url": None, "error": last_err,
                     "elapsed": round(time.time() - t_start, 2)}
         
@@ -1166,25 +1161,22 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                        f"(min ↓{min_down} ↑{min_up})")
                 return {"ok": False, "latency": lat, "latency_keepalive": lat_ka,
                         "download_mbps": down_mbps, "upload_mbps": up_mbps,
-                        "ip": None, "country_code": "", "country": "",
-                        "inbound_ip": "", "exit_ip": "", "is_cascade": False, "cascade_msg": "",
+                        "ip": None, "country_code": "EU", "country": "EU",
+                        "inbound_ip": "", "exit_ip": "", "is_cascade": True, "cascade_msg": "Каскад 🇪🇺EU → 🇪🇺EU",
                         "test_url": working_url, "error": err,
                         "elapsed": round(time.time() - t_start, 2)}
         
         # ========================================================================
-        # УМНОЕ ОПРЕДЕЛЕНИЕ IP И КАСКАДОВ (с приоритетом на 2ip.io)
+        # ЖЕСТКОЕ ОПРЕДЕЛЕНИЕ IP И КАСКАДОВ (ФОЛЛБЕК НА 🇪🇺 EU)
         # ========================================================================
-        cc, cn, ip = "", "", ""
         inbound_ip = ""
         exit_ip = ""
         exit_cc = ""
-        exit_cn = ""
         is_cascade = False
         cascade_msg = ""
         
         country_budget = min(remaining(), 4.0)
 
-        # 1. Пытаемся определить ВХОДНОЙ IP (адрес самого сервера прокси)
         server_host = pr.params.get("server", "")
         if server_host and country_budget > 0.5:
             try:
@@ -1192,7 +1184,6 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             except Exception:
                 pass
 
-        # 2. Пытаемся определить ВЫХОДНОЙ IP через надежные сервисы
         if country_budget > 0.5:
             for url in IP_CHECK_URLS:
                 try:
@@ -1204,43 +1195,48 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                                 exit_ip = data.get("ip") or data.get("query") or ""
                                 exit_cc = data.get("country_code") or data.get("countryCode") or ""
                                 if exit_ip and len(exit_ip) > 6:
-                                    exit_cn = country_ru(exit_cc)
-                                    break # Успех
+                                    break
                             except Exception:
                                 continue
                         else:
                             exit_ip = r.text.strip()
                             if exit_ip and len(exit_ip) > 6:
-                                break # Успех
+                                break
                 except Exception:
                     continue
 
-        # 3. Если получили выходной IP, но не страну, пробуем узнать страну конкретно для него
         if exit_ip and not exit_cc and country_budget > 0.5:
             try:
                 r_geo = session.get(f"https://ipapi.co/{exit_ip}/json/", timeout=min(remaining(), 2.0))
                 if r_geo.status_code == 200:
                     data = r_geo.json()
                     exit_cc = data.get("country_code", "")
-                    exit_cn = country_ru(exit_cc)
             except Exception:
                 pass
 
-        # 4. Формируем итоговые значения для сохранения в кэш
-        final_ip = exit_ip or inbound_ip or ip
-        final_cc = exit_cc or cc or prior_cc
-        final_cn = exit_cn or cn or country_ru(final_cc)
-
-        # 5. Формируем сообщение о каскаде для логов
+        # ЖЕСТКАЯ ЛОГИКА ФОЛЛБЕКА НА EU
+        in_flag = "🇪🇺" if not prior_cc else flag_from_cc(prior_cc)
+        in_name = "EU" if not prior_cc else country_ru(prior_cc)
+        
+        out_flag = "🇪🇺" if not exit_cc else flag_from_cc(exit_cc)
+        out_name = "EU" if not exit_cc else country_ru(exit_cc)
+        
         if inbound_ip and exit_ip and inbound_ip != exit_ip:
             is_cascade = True
-            in_flag = flag_from_cc(prior_cc) if prior_cc else "🏳️"
-            out_flag = flag_from_cc(exit_cc) if exit_cc else "🏳️"
-            cascade_msg = f"Каскад {in_flag}ВХОД → {out_flag}ВЫХОД"
+            cascade_msg = f"Каскад {in_flag}{in_name} → {out_flag}{out_name}"
         elif not exit_ip and inbound_ip:
-            cascade_msg = f"Только ВХОД: {inbound_ip}"
+            is_cascade = True
+            cascade_msg = f"Каскад {in_flag}{in_name} → 🇪🇺EU"
         elif exit_ip and not inbound_ip:
-            cascade_msg = f"Только ВЫХОД: {exit_ip}"
+            is_cascade = True
+            cascade_msg = f"Каскад 🇪🇺EU → {out_flag}{out_name}"
+        else:
+            is_cascade = True
+            cascade_msg = f"Каскад 🇪🇺EU → 🇪🇺EU"
+
+        final_ip = exit_ip or inbound_ip
+        final_cc = exit_cc or prior_cc or "EU"
+        final_cn = "EU" if final_cc == "EU" else country_ru(final_cc)
         # ========================================================================
         
         session.close()
@@ -1438,12 +1434,12 @@ def _load_recheck_files(paths):
     return _dedup(result)
 
 def _build_country_config(cc, cn, servers, cluster="regular", stable_cfg=None, new_cfg=None):
-    flag = flag_from_cc(cc) if cc else "🏳️"
-    name = cn or country_ru(cc)
+    flag = "🇪🇺" if cc == "EU" else flag_from_cc(cc)
+    name = "EU" if cc == "EU" else (cn or country_ru(cc))
     mark = marker_for(cluster, stable_cfg, new_cfg)
     prefix = f"{mark} " if mark else ""
     remarks = f"{prefix}{flag} {name} | @XelaraVpn"
-    prefix_id = (cc or "xx").lower()
+    prefix_id = (cc or "eu").lower()
 
     outbounds, tags = [], []
     for i, (pr, _r) in enumerate(servers, 1):
@@ -1569,7 +1565,7 @@ class OutputWriter:
         lines = []
         for i, v in enumerate(top, 1):
             p = cache.to_proxy(v)
-            flag = resolve_flag(v)
+            flag = "🇪🇺" if v.get("country_code") == "EU" else resolve_flag(v)
             dn = v.get("download_mbps")
             up = v.get("upload_mbps")
             lat = v.get("latency")
@@ -1599,7 +1595,7 @@ class OutputWriter:
         for v in cache.items.values():
             if v.get("status") != "working": continue
             if not (v.get("params") or {}).get("server"): continue
-            cc = v.get("country_code") or ""
+            cc = v.get("country_code") or "EU"
             cluster = cache.classify(v, stable_cfg, new_cfg)
             groups[(cc, cluster)].append((cache.to_proxy(v), {"latency": v.get("latency")}))
 
@@ -1608,7 +1604,7 @@ class OutputWriter:
                                   key=lambda k: (k[0], order.get(k[1], 3))):
             rows = groups[(cc, cluster)]
             if not rows: continue
-            cfg = _build_country_config(cc, country_ru(cc), rows,
+            cfg = _build_country_config(cc, "EU" if cc == "EU" else country_ru(cc), rows,
                                         cluster=cluster, stable_cfg=stable_cfg,
                                         new_cfg=new_cfg)
             cfg["_counts"] = {"cluster": cluster, "total": len(rows)}
@@ -1632,13 +1628,13 @@ class OutputWriter:
         by_country = defaultdict(list)
         for p in proxies:
             it = cache.items.get(p.dedup_key(), {})
-            cc = it.get("country_code") or ""
+            cc = it.get("country_code") or "EU"
             by_country[cc].append((p, {"latency": it.get("latency")}))
 
         configs = []
         for cc in sorted(by_country.keys()):
             configs.append(_build_country_config(
-                cc, country_ru(cc), by_country[cc],
+                cc, "EU" if cc == "EU" else country_ru(cc), by_country[cc],
                 cluster=cluster, stable_cfg=stable_cfg, new_cfg=new_cfg))
 
         js_path = self.allworking / f"{name}_latest.json"
@@ -1681,7 +1677,8 @@ def _named_lines(cache, proxies, stable_cfg=None, new_cfg=None):
     lines = []
     for i, p in enumerate(proxies, 1):
         it = cache.items.get(p.dedup_key(), {})
-        flag = resolve_flag(it)
+        cc = it.get("country_code") or "EU"
+        flag = "🇪🇺" if cc == "EU" else resolve_flag(it)
         cluster = cache.classify(it, stable_cfg, new_cfg)
         mark = marker_for(cluster, stable_cfg, new_cfg)
         prefix = f"{mark} " if mark else ""
@@ -1759,20 +1756,18 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                             sp_s = (f" ↓{dn if dn is not None else '—'}Mbps "
                                     f"↑{up if up is not None else '—'}Mbps")
                         if r["ok"]:
-                            flag = flag_from_cc(r.get("country_code", ""))
-                            cn = country_ru(r.get("country_code", ""))
+                            cc = r.get("country_code") or "EU"
+                            flag = "🇪🇺" if cc == "EU" else flag_from_cc(cc)
+                            cn = "EU" if cc == "EU" else country_ru(cc)
                             ka = r.get("latency_keepalive")
                             ka_s = f"ka={ka}ms" if ka is not None else "ka=—"
                             el = r.get("elapsed")
                             el_s = f" {el}s" if el is not None else ""
                             
-                            # Новая логика отображения IP и каскадов
                             display_ip = r.get("exit_ip") or r.get("ip") or r.get("inbound_ip") or "???"
                             cascade_s = ""
                             if r.get("is_cascade"):
                                 cascade_s = f" 🔄 {r.get('cascade_msg', '')}"
-                            elif not r.get("exit_ip") and not r.get("inbound_ip"):
-                                cascade_s = " ⚠️ IP не определен"
                             
                             print(f"  {pass_label} [{n}/{tot}] OK {flag} {cn} {r['latency']}ms "
                                   f"{ka_s}{sp_s}{el_s} ip={display_ip}{cascade_s} | {label}", flush=True)
@@ -1886,12 +1881,13 @@ def _write_final(cache, writer, sources_count, final_file="working.txt",
                 dn = v.get("download_mbps")
                 up = v.get("upload_mbps")
                 lat = v.get("latency")
-                flag = resolve_flag(v)
-                cc = country_ru(v.get("country_code", ""))
+                cc = v.get("country_code") or "EU"
+                flag = "🇪🇺" if cc == "EU" else resolve_flag(v)
+                cn = "EU" if cc == "EU" else country_ru(cc)
                 s_dn = f"↓{dn}Mbps" if dn is not None else "↓—"
                 s_up = f"↑{up}Mbps" if up is not None else "↑—"
                 s_lat = f"{lat}ms" if lat is not None else "?ms"
-                print(f"    #{i} {flag} {cc}: {s_dn} {s_up} {s_lat}")
+                print(f"    #{i} {flag} {cn}: {s_dn} {s_up} {s_lat}")
         else:
             print("[i] top150.txt: нет данных (все серверы без скорости и пинга)")
     except Exception as e:
