@@ -3,7 +3,7 @@
 """
 Combined Source Loader + Xray Parser & Checker
 v-dbl + v-speed + v-stable + v-new + blacklist + batched + split-cache + top-fastest
-[ИСПРАВЛЕНО]: Структура JSON конфига Xray и дефолтные параметры speed_test
+[ИСПРАВЛЕНО]: Структура JSON, дефолтный speed_test, надежные IP-сервисы (2ip.io), логика Каскада.
 """
 
 import importlib, subprocess, sys
@@ -107,7 +107,14 @@ CACHE_VERSION = 5
 SERVER_TIMEOUT_DEFAULT = 8.0
 
 TEST_URLS_FALLBACK = ["https://www.gstatic.com/generate_204"]
-IP_URL = "https://api.ipify.org"
+
+# НАДЕЖНЫЕ СЕРВИСЫ ДЛЯ ОПРЕДЕЛЕНИЯ IP (Приоритет: 2ip.io, ipapi.co, ipify)
+IP_CHECK_URLS = [
+    "https://2ip.io/json/",
+    "https://ipapi.co/json/",
+    "https://api.ipify.org?format=json",
+    "https://ifconfig.me/ip",
+]
 
 SPEED_DOWN_URLS = [
     "https://speed.cloudflare.com/__down?bytes=2000000",
@@ -143,7 +150,7 @@ HY2_REGEX     = re.compile(r"(?:hysteria2|hy2)://[^\s#]+", re.IGNORECASE)
 URL_REGEX     = re.compile(r'https?://[^\s<>"\'(){}|^`\[\]]+', re.IGNORECASE)
 BASE64_REGEX  = re.compile(r'^[A-Za-z0-9+/]+=*$', re.MULTILINE)
 UUID_REGEX    = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
-URI_REGEX     = re.compile(r"(?:vless|vmess|trojan|ss)://[^\s\"'<>]+")
+URI_REGEX     = re.compile(r"(?:vless|vmess|trojan|ss|hy2|hysteria2)://[^\s\"'<>]+")
 
 COUNTRY_RU = {
     "RU": "Россия", "DE": "Германия", "NL": "Нидерланды", "SE": "Швеция",
@@ -956,7 +963,8 @@ class Cache:
             it["consecutive_successes"] += 1
             it["fail_count"] = 0
             for k in ("latency", "latency_keepalive", "download_mbps", "upload_mbps",
-                      "ip", "country_code", "country", "test_url", "elapsed"):
+                      "ip", "country_code", "country", "test_url", "elapsed",
+                      "inbound_ip", "exit_ip", "is_cascade", "cascade_msg"):
                 if k in result and result[k] is not None:
                     it[k] = result[k]
         else:
@@ -1040,7 +1048,7 @@ class Cache:
         return it.get("fail_count", 0) >= BLACKLIST_FAIL_THRESHOLD
 
 # ============================================================================
-# Проверка прокси (ИСПРАВЛЕНА СТРУКТУРА JSON И ДЕФОЛТНЫЕ ПАРАМЕТРЫ)
+# Проверка прокси (ИСПРАВЛЕНО: JSON, дефолты, умный IP/Каскад с 2ip.io)
 # ============================================================================
 def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 prior_cc="", server_timeout=None,
@@ -1056,7 +1064,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
     if send_through:
         ob.setdefault("streamSettings", {}).setdefault("sockopt", {})["sendThrough"] = send_through
     
-    # ИСПРАВЛЕНИЕ: inbounds и outbounds вынесены на верхний уровень, а не внутрь dns
+    # ИСПРАВЛЕНИЕ: inbounds и outbounds вынесены на верхний уровень
     cfg = {
         "log": {"loglevel": "warning"},
         "dns": {
@@ -1093,6 +1101,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             return {"ok": False, "latency": None, "latency_keepalive": None,
                     "download_mbps": None, "upload_mbps": None,
                     "ip": None, "country_code": "", "country": "",
+                    "inbound_ip": "", "exit_ip": "", "is_cascade": False, "cascade_msg": "",
                     "test_url": None, "error": msg,
                     "elapsed": round(time.time() - t_start, 2)}
         
@@ -1125,6 +1134,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             return {"ok": False, "latency": None, "latency_keepalive": None,
                     "download_mbps": None, "upload_mbps": None,
                     "ip": None, "country_code": "", "country": "",
+                    "inbound_ip": "", "exit_ip": "", "is_cascade": False, "cascade_msg": "",
                     "test_url": None, "error": last_err,
                     "elapsed": round(time.time() - t_start, 2)}
         
@@ -1157,34 +1167,88 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 return {"ok": False, "latency": lat, "latency_keepalive": lat_ka,
                         "download_mbps": down_mbps, "upload_mbps": up_mbps,
                         "ip": None, "country_code": "", "country": "",
+                        "inbound_ip": "", "exit_ip": "", "is_cascade": False, "cascade_msg": "",
                         "test_url": working_url, "error": err,
                         "elapsed": round(time.time() - t_start, 2)}
         
+        # ========================================================================
+        # УМНОЕ ОПРЕДЕЛЕНИЕ IP И КАСКАДОВ (с приоритетом на 2ip.io)
+        # ========================================================================
         cc, cn, ip = "", "", ""
-        country_budget = min(remaining(), 3.0)
-        if prior_cc:
-            cc = prior_cc
-        if country_budget > 0.3:
+        inbound_ip = ""
+        exit_ip = ""
+        exit_cc = ""
+        exit_cn = ""
+        is_cascade = False
+        cascade_msg = ""
+        
+        country_budget = min(remaining(), 4.0)
+
+        # 1. Пытаемся определить ВХОДНОЙ IP (адрес самого сервера прокси)
+        server_host = pr.params.get("server", "")
+        if server_host and country_budget > 0.5:
             try:
-                r = session.get(IP_URL, timeout=country_budget)
-                if r.status_code == 200:
-                    ip = r.text.strip()
+                inbound_ip = socket.gethostbyname(server_host)
             except Exception:
                 pass
-        elif country_budget > 0.3:
-            cc, cn, ip = _detect_country(session, country_budget)
-            if not ip and remaining() > 0.3:
+
+        # 2. Пытаемся определить ВЫХОДНОЙ IP через надежные сервисы
+        if country_budget > 0.5:
+            for url in IP_CHECK_URLS:
                 try:
-                    r = session.get(IP_URL, timeout=min(remaining(), 2.0))
+                    r = session.get(url, timeout=min(remaining(), 2.5))
                     if r.status_code == 200:
-                        ip = r.text.strip()
+                        if "json" in url or "ipapi" in url:
+                            try:
+                                data = r.json()
+                                exit_ip = data.get("ip") or data.get("query") or ""
+                                exit_cc = data.get("country_code") or data.get("countryCode") or ""
+                                if exit_ip and len(exit_ip) > 6:
+                                    exit_cn = country_ru(exit_cc)
+                                    break # Успех
+                            except Exception:
+                                continue
+                        else:
+                            exit_ip = r.text.strip()
+                            if exit_ip and len(exit_ip) > 6:
+                                break # Успех
                 except Exception:
-                    pass
+                    continue
+
+        # 3. Если получили выходной IP, но не страну, пробуем узнать страну конкретно для него
+        if exit_ip and not exit_cc and country_budget > 0.5:
+            try:
+                r_geo = session.get(f"https://ipapi.co/{exit_ip}/json/", timeout=min(remaining(), 2.0))
+                if r_geo.status_code == 200:
+                    data = r_geo.json()
+                    exit_cc = data.get("country_code", "")
+                    exit_cn = country_ru(exit_cc)
+            except Exception:
+                pass
+
+        # 4. Формируем итоговые значения для сохранения в кэш
+        final_ip = exit_ip or inbound_ip or ip
+        final_cc = exit_cc or cc or prior_cc
+        final_cn = exit_cn or cn or country_ru(final_cc)
+
+        # 5. Формируем сообщение о каскаде для логов
+        if inbound_ip and exit_ip and inbound_ip != exit_ip:
+            is_cascade = True
+            in_flag = flag_from_cc(prior_cc) if prior_cc else "🏳️"
+            out_flag = flag_from_cc(exit_cc) if exit_cc else "🏳️"
+            cascade_msg = f"Каскад {in_flag}ВХОД → {out_flag}ВЫХОД"
+        elif not exit_ip and inbound_ip:
+            cascade_msg = f"Только ВХОД: {inbound_ip}"
+        elif exit_ip and not inbound_ip:
+            cascade_msg = f"Только ВЫХОД: {exit_ip}"
+        # ========================================================================
         
         session.close()
         return {"ok": True, "latency": lat, "latency_keepalive": lat_ka,
                 "download_mbps": down_mbps, "upload_mbps": up_mbps,
-                "ip": ip, "country_code": cc, "country": cn,
+                "ip": final_ip, "country_code": final_cc, "country": final_cn,
+                "inbound_ip": inbound_ip, "exit_ip": exit_ip,
+                "is_cascade": is_cascade, "cascade_msg": cascade_msg,
                 "test_url": working_url, "error": None,
                 "elapsed": round(time.time() - t_start, 2)}
     finally:
@@ -1338,6 +1402,40 @@ def _dedup(proxies):
         if k in seen: continue
         seen.add(k); out.append(p)
     return out
+
+def _load_recheck_files(paths):
+    result = []
+    for path_str in paths:
+        path_str = path_str.strip()
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if not p.exists():
+            print(f"[i] recheck: {path_str} — не найден")
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"[!] recheck: {path_str}: {e}")
+            continue
+        
+        parsed = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pr = parse_uri(line)
+            if pr and pr.params.get("server"):
+                parsed.append(pr)
+            else:
+                for u in URI_REGEX.findall(line):
+                    pr2 = parse_uri(u)
+                    if pr2 and pr2.params.get("server"):
+                        parsed.append(pr2)
+                        
+        print(f"[i] recheck: {path_str} → {len(parsed)} серверов")
+        result.extend(parsed)
+    return _dedup(result)
 
 def _build_country_config(cc, cn, servers, cluster="regular", stable_cfg=None, new_cfg=None):
     flag = flag_from_cc(cc) if cc else "🏳️"
@@ -1667,8 +1765,17 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index,
                             ka_s = f"ka={ka}ms" if ka is not None else "ka=—"
                             el = r.get("elapsed")
                             el_s = f" {el}s" if el is not None else ""
+                            
+                            # Новая логика отображения IP и каскадов
+                            display_ip = r.get("exit_ip") or r.get("ip") or r.get("inbound_ip") or "???"
+                            cascade_s = ""
+                            if r.get("is_cascade"):
+                                cascade_s = f" 🔄 {r.get('cascade_msg', '')}"
+                            elif not r.get("exit_ip") and not r.get("inbound_ip"):
+                                cascade_s = " ⚠️ IP не определен"
+                            
                             print(f"  {pass_label} [{n}/{tot}] OK {flag} {cn} {r['latency']}ms "
-                                  f"{ka_s}{sp_s}{el_s} ip={r['ip']} | {label}", flush=True)
+                                  f"{ka_s}{sp_s}{el_s} ip={display_ip}{cascade_s} | {label}", flush=True)
                         else:
                             el = r.get("elapsed")
                             el_s = f" {el}s" if el is not None else ""
@@ -1861,45 +1968,6 @@ def _detect_country(session, timeout):
             except Exception:
                 continue
     return "", "", ""
-
-# ============================================================================
-# Перепроверка файлов (восстановленная функция)
-# ============================================================================
-def _load_recheck_files(paths):
-    result = []
-    for path_str in paths:
-        path_str = path_str.strip()
-        if not path_str:
-            continue
-        p = Path(path_str)
-        if not p.exists():
-            print(f"[i] recheck: {path_str} — не найден")
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            print(f"[!] recheck: {path_str}: {e}")
-            continue
-        
-        parsed = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # Пробуем распарсить строку как есть
-            pr = parse_uri(line)
-            if pr and pr.params.get("server"):
-                parsed.append(pr)
-            else:
-                # Если не вышло, ищем URI регуляркой в строке
-                for u in URI_REGEX.findall(line):
-                    pr2 = parse_uri(u)
-                    if pr2 and pr2.params.get("server"):
-                        parsed.append(pr2)
-                        
-        print(f"[i] recheck: {path_str} → {len(parsed)} серверов")
-        result.extend(parsed)
-    return _dedup(result)
 
 # ============================================================================
 # main
