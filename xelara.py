@@ -1863,6 +1863,45 @@ def _detect_country(session, timeout):
     return "", "", ""
 
 # ============================================================================
+# Перепроверка файлов (восстановленная функция)
+# ============================================================================
+def _load_recheck_files(paths):
+    result = []
+    for path_str in paths:
+        path_str = path_str.strip()
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if not p.exists():
+            print(f"[i] recheck: {path_str} — не найден")
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"[!] recheck: {path_str}: {e}")
+            continue
+        
+        parsed = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Пробуем распарсить строку как есть
+            pr = parse_uri(line)
+            if pr and pr.params.get("server"):
+                parsed.append(pr)
+            else:
+                # Если не вышло, ищем URI регуляркой в строке
+                for u in URI_REGEX.findall(line):
+                    pr2 = parse_uri(u)
+                    if pr2 and pr2.params.get("server"):
+                        parsed.append(pr2)
+                        
+        print(f"[i] recheck: {path_str} → {len(parsed)} серверов")
+        result.extend(parsed)
+    return _dedup(result)
+
+# ============================================================================
 # main
 # ============================================================================
 def main():
