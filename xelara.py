@@ -3,6 +3,7 @@
 """
 Combined Source Loader + Xray Parser & Checker
 v-dbl + v-speed + v-stable + v-new + blacklist + batched + split-cache + top-fastest
+[ИСПРАВЛЕНО]: Структура JSON конфига Xray и дефолтные параметры speed_test
 """
 
 import importlib, subprocess, sys
@@ -139,7 +140,7 @@ def marker_for(cluster, stable_cfg=None, new_cfg=None):
 VLESS_REGEX   = re.compile(r"vless://[^\s#]+", re.IGNORECASE)
 TROJAN_REGEX  = re.compile(r"trojan://[^\s#]+", re.IGNORECASE)
 HY2_REGEX     = re.compile(r"(?:hysteria2|hy2)://[^\s#]+", re.IGNORECASE)
-URL_REGEX     = re.compile(r'https?://[^\s<>"\'(){}|\\^`\[\]]+', re.IGNORECASE)
+URL_REGEX     = re.compile(r'https?://[^\s<>"\'(){}|^`\[\]]+', re.IGNORECASE)
 BASE64_REGEX  = re.compile(r'^[A-Za-z0-9+/]+=*$', re.MULTILINE)
 UUID_REGEX    = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 URI_REGEX     = re.compile(r"(?:vless|vmess|trojan|ss)://[^\s\"'<>]+")
@@ -818,9 +819,8 @@ def _p_vless(uri):
                      "pbk": q.get("pbk", ""), "sid": q.get("sid", ""),
                      "spx": q.get("spx", ""),
                      "path": q.get("path", ""), "host": q.get("host", ""),
-                     "serviceName": q.get("serviceName", ""), "alpn": q.get("alpn", ""),
-                     "headerType": q.get("headerType", ""), "mode": q.get("mode", ""),
-                     "extra": extra,
+                     "serviceName": q.get("serviceName", ""),
+                     "alpn": q.get("alpn", ""), "extra": extra,
                  })
 
 def _p_trojan(uri):
@@ -832,691 +832,249 @@ def _p_trojan(uri):
                  params={
                      "server": u.hostname, "port": _safe_int(u.port, 443),
                      "password": unquote(u.username or ""),
-                     "sni": q.get("sni", ""), "fp": q.get("fp", ""),
                      "network": q.get("type", "tcp") or "tcp",
                      "security": q.get("security", "tls") or "tls",
+                     "sni": q.get("sni", ""), "fp": q.get("fp", ""),
                      "path": q.get("path", ""), "host": q.get("host", ""),
-                     "serviceName": q.get("serviceName", ""), "alpn": q.get("alpn", ""),
-                     "allowInsecure": q.get("allowInsecure", "0") == "1",
+                     "serviceName": q.get("serviceName", ""),
+                     "alpn": q.get("alpn", ""),
                  })
 
-def _p_ss(uri):
-    body = uri[len("ss://"):]
-    tag = ""
-    if "#" in body:
-        body, tag = body.split("#", 1)
-    tag = unquote(tag) if tag else ""
-    if "@" not in body:
-        d = _b64decode(body)
-        if "@" not in d: return None
-        method_pw, host_port = d.rsplit("@", 1)
-    else:
-        ui, host_port = body.rsplit("@", 1)
-        method_pw = unquote(ui) if ":" in ui else _b64decode(ui)
-    if ":" not in method_pw or ":" not in host_port: return None
-    method, password = method_pw.split(":", 1)
-    host, port = host_port.rsplit(":", 1)
-    return Proxy(raw=uri, kind="ss", name=tag, params={
-        "server": host.strip(), "port": _safe_int(port.strip(), 8388),
-        "method": method.strip(), "password": password,
-        "network": "tcp", "security": "none",
-    })
+def _p_hy2(uri):
+    u = _safe_urlparse(uri)
+    if u is None or not u.hostname: return None
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    return Proxy(raw=uri, kind="hysteria2",
+                 name=unquote(u.fragment) if u.fragment else "",
+                 params={
+                     "server": u.hostname, "port": _safe_int(u.port, 443),
+                     "password": unquote(u.username or ""),
+                     "sni": q.get("sni", ""), "insecure": q.get("insecure", "0") == "1",
+                     "obfs": q.get("obfs", ""), "obfs-password": q.get("obfs-password", ""),
+                 })
 
-_P = {"vmess://": _p_vmess, "vless://": _p_vless,
-      "trojan://": _p_trojan, "ss://": _p_ss}
-
-def parse_uri(uri):
+def parse_uri(uri: str) -> Optional[Proxy]:
     uri = uri.strip()
-    if not uri or uri.startswith("#"): return None
-    for p, fn in _P.items():
-        if uri.startswith(p):
-            try: return fn(uri)
-            except Exception: return None
+    if uri.startswith("vmess://"): return _p_vmess(uri)
+    if uri.startswith("vless://"): return _p_vless(uri)
+    if uri.startswith("trojan://"): return _p_trojan(uri)
+    if uri.startswith(("hysteria2://", "hy2://")): return _p_hy2(uri)
     return None
 
-def _extract_uris(text):
-    return URI_REGEX.findall(text)
-
-def _host_ws(ss):
-    ws = ss.get("wsSettings") or {}
-    if ws.get("host"): return ws["host"]
-    hv = (ws.get("headers") or {}).get("Host")
-    if isinstance(hv, list) and hv: return hv[0]
-    return hv if isinstance(hv, str) else ""
-
-def _parse_json_sub(text):
-    try: data = json.loads(text)
-    except Exception: return []
-    obs = []
-    if isinstance(data, dict):
-        obs = data.get("outbounds") or []
-        if not obs and "configs" in data:
-            for c in data["configs"]:
-                obs.extend(c.get("outbounds", []))
-    elif isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict): continue
-            if "outbounds" in item: obs.extend(item.get("outbounds") or [])
-            elif item.get("protocol"): obs.append(item)
-    return [r for r in (_ob_to_proxy(o) for o in obs) if r]
-
-def _ob_to_proxy(ob):
-    proto = (ob.get("protocol") or "").lower()
-    s = ob.get("settings") or {}
-    ss = ob.get("streamSettings") or {}
-    tag = ob.get("tag", "")
-    net = (ss.get("network") or "tcp").lower()
-    sec = (ss.get("security") or "none").lower()
-    if proto == "vless":
-        v = (s.get("vnext") or [{}])[0]; u = (v.get("users") or [{}])[0]
-        tl = ss.get("tlsSettings") or ss.get("realitySettings") or {}
-        xh = ss.get("xhttpSettings") or {}; ws = ss.get("wsSettings") or {}
-        gr = ss.get("grpcSettings") or {}
-        return Proxy(kind="vless", name=tag, params={
-            "server": v.get("address", ""), "port": _safe_int(v.get("port"), 443),
-            "uuid": u.get("id", ""), "flow": u.get("flow", ""),
-            "network": net, "security": sec,
-            "sni": tl.get("serverName", ""), "fp": tl.get("fingerprint", ""),
-            "pbk": (ss.get("realitySettings") or {}).get("publicKey", ""),
-            "sid": (ss.get("realitySettings") or {}).get("shortId", ""),
-            "spx": (ss.get("realitySettings") or {}).get("spiderX", "/"),
-            "path": ws.get("path", "") or xh.get("path", ""),
-            "host": _host_ws(ss) or xh.get("host", "") or gr.get("authority", ""),
-            "serviceName": gr.get("serviceName", ""), "mode": xh.get("mode", ""),
-            "alpn": ",".join(tl.get("alpn", []) or []),
-            "extra": xh.get("extra") or {},
-        })
-    if proto == "vmess":
-        v = (s.get("vnext") or [{}])[0]; u = (v.get("users") or [{}])[0]
-        tl = ss.get("tlsSettings") or {}; xh = ss.get("xhttpSettings") or {}
-        return Proxy(kind="vmess", name=tag, params={
-            "server": v.get("address", ""), "port": _safe_int(v.get("port"), 443),
-            "uuid": u.get("id", ""), "alterId": _safe_int(u.get("alterId"), 0),
-            "cipher": u.get("security", "auto"),
-            "network": net, "security": sec,
-            "sni": tl.get("serverName", ""), "fp": tl.get("fingerprint", ""),
-            "host": _host_ws(ss) or xh.get("host", ""),
-            "path": (ss.get("wsSettings") or {}).get("path", "") or xh.get("path", ""),
-            "extra": xh.get("extra") or {},
-        })
-    if proto == "trojan":
-        srv = (s.get("servers") or [{}])[0]; tl = ss.get("tlsSettings") or {}
-        xh = ss.get("xhttpSettings") or {}
-        return Proxy(kind="trojan", name=tag, params={
-            "server": srv.get("address", ""), "port": _safe_int(srv.get("port"), 443),
-            "password": srv.get("password", ""),
-            "network": net, "security": sec or "tls",
-            "sni": tl.get("serverName", ""), "fp": tl.get("fingerprint", ""),
-            "host": _host_ws(ss) or xh.get("host", ""),
-            "path": (ss.get("wsSettings") or {}).get("path", "") or xh.get("path", ""),
-            "extra": xh.get("extra") or {},
-        })
-    if proto == "shadowsocks":
-        srv = (s.get("servers") or [{}])[0]
-        return Proxy(kind="ss", name=tag, params={
-            "server": srv.get("address", ""), "port": _safe_int(srv.get("port"), 8388),
-            "method": srv.get("method", ""), "password": srv.get("password", ""),
-            "network": "tcp", "security": "none",
-        })
-    return None
-
-def parse_response_body(body):
-    body = body.strip()
-    if not body: return []
-    if body.lstrip().startswith(("{", "[")):
-        return _parse_json_sub(body)
-    uris = _extract_uris(body)
-    if uris:
-        return [p for p in (parse_uri(u) for u in uris) if p]
-    d = _b64decode(re.sub(r"\s+", "", body))
-    if d:
-        dd = d.strip()
-        if dd.lstrip().startswith(("{", "[")):
-            jp = _parse_json_sub(dd)
-            if jp: return jp
-        return [p for p in (parse_uri(u) for u in _extract_uris(dd)) if p]
-    return []
-
-def dump_to_uri(pr, override_name=None):
-    if override_name is None and pr.raw:
-        return pr.raw
-    name = override_name if override_name is not None else pr.name
-    p = pr.params
-    if pr.kind == "vless":
-        q = []
-        if p.get("security") and p["security"] != "none": q.append(f"security={p['security']}")
-        if p.get("network") and p["network"] != "tcp":    q.append(f"type={p['network']}")
-        for k in ("sni", "fp", "pbk", "sid", "spx", "flow", "path", "host", "mode", "serviceName"):
-            if p.get(k): q.append(f"{k}={p[k]}")
-        if p.get("alpn"):       q.append(f"alpn={p['alpn']}")
-        if p.get("headerType"): q.append(f"headerType={p['headerType']}")
-        if p.get("extra"):
-            try:
-                js = json.dumps(p["extra"], ensure_ascii=False, separators=(",", ":"))
-                q.append(f"extra={quote(js, safe='')}")
-            except Exception: pass
-        frag = f"#{name}" if name else ""
-        return f"vless://{p.get('uuid','')}@{p['server']}:{p['port']}?{'&'.join(q)}{frag}"
-    if pr.kind == "trojan":
-        q = []
-        if p.get("sni"): q.append(f"sni={p['sni']}")
-        if p.get("security") and p["security"] != "tls": q.append(f"security={p['security']}")
-        frag = f"#{name}" if name else ""
-        return f"trojan://{p.get('password','')}@{p['server']}:{p['port']}?{'&'.join(q)}{frag}"
-    if pr.kind == "ss":
-        ui = base64.b64encode(f"{p.get('method','')}:{p.get('password','')}".encode()).decode()
-        frag = f"#{name}" if name else ""
-        return f"ss://{ui}@{p['server']}:{p['port']}{frag}"
-    if pr.kind == "vmess":
-        obj = {"v": "2", "ps": name, "add": p["server"], "port": str(p["port"]),
-               "id": p.get("uuid", ""), "aid": str(p.get("alterId", 0)),
-               "scy": p.get("cipher", "auto"), "net": p.get("network", "tcp"),
-               "type": "none", "host": p.get("host", ""), "path": p.get("path", ""),
-               "tls": "tls" if p.get("tls") else "", "sni": p.get("sni", ""),
-               "fp": p.get("fp", "")}
-        if p.get("extra"): obj["extra"] = p["extra"]
-        return "vmess://" + base64.b64encode(
-            json.dumps(obj, ensure_ascii=False).encode()).decode()
-    return pr.raw or ""
+def dump_to_uri(p: Proxy, override_name: str = "") -> str:
+    if p.kind == "vless":
+        return outbound_to_vless_url({"protocol": "vless", "tag": override_name or p.name,
+            "settings": {"vnext": [{"address": p.params["server"], "port": p.params["port"],
+            "users": [{"id": p.params["uuid"], "encryption": "none", "flow": p.params.get("flow", "")}]}]},
+            "streamSettings": {"network": p.params.get("network", "tcp"), "security": p.params.get("security", "none"),
+            "tlsSettings": {"serverName": p.params.get("sni", ""), "fingerprint": p.params.get("fp", ""),
+            "alpn": p.params.get("alpn", "").split(",") if p.params.get("alpn") else []},
+            "realitySettings": {"serverName": p.params.get("sni", ""), "publicKey": p.params.get("pbk", ""),
+            "shortId": p.params.get("sid", ""), "fingerprint": p.params.get("fp", "")},
+            "wsSettings": {"path": p.params.get("path", ""), "headers": {"Host": p.params.get("host", "")} if p.params.get("host") else {}},
+            "grpcSettings": {"serviceName": p.params.get("serviceName", "")}}})
+    elif p.kind == "trojan":
+        return outbound_to_trojan_url({"protocol": "trojan", "tag": override_name or p.name,
+            "settings": {"servers": [{"address": p.params["server"], "port": p.params["port"], "password": p.params["password"]}]},
+            "streamSettings": {"network": p.params.get("network", "tcp"), "security": p.params.get("security", "tls"),
+            "tlsSettings": {"serverName": p.params.get("sni", ""), "fingerprint": p.params.get("fp", ""),
+            "alpn": p.params.get("alpn", "").split(",") if p.params.get("alpn") else []},
+            "wsSettings": {"path": p.params.get("path", ""), "headers": {"Host": p.params.get("host", "")} if p.params.get("host") else {}},
+            "grpcSettings": {"serviceName": p.params.get("serviceName", "")}}})
+    elif p.kind == "hysteria2":
+        return outbound_to_hysteria2_url({"protocol": "hysteria2", "tag": override_name or p.name,
+            "settings": {"servers": [{"address": p.params["server"], "port": p.params["port"], "auth": p.params["password"]}]},
+            "streamSettings": {"security": "tls", "tlsSettings": {"serverName": p.params.get("sni", ""),
+            "allowInsecure": p.params.get("insecure", False)},
+            "transport": {"hopConfig": {"obfs": p.params.get("obfs", ""), "password": p.params.get("obfs-password", "")} if p.params.get("obfs") else {}}}})
+    return p.raw or ""
 
 # ============================================================================
-# Cache
+# Кэш
 # ============================================================================
+@dataclass
+class CacheItem:
+    proxy: Proxy
+    status: str = "unknown"
+    latency: Optional[int] = None
+    latency_keepalive: Optional[int] = None
+    download_mbps: Optional[float] = None
+    upload_mbps: Optional[float] = None
+    ip: str = ""
+    country_code: str = ""
+    country: str = ""
+    test_url: str = ""
+    error: str = ""
+    elapsed: float = 0.0
+    first_seen: str = field(default_factory=_now)
+    last_checked: str = field(default_factory=_now)
+    check_count: int = 0
+    fail_count: int = 0
+    consecutive_fails: int = 0
+    consecutive_successes: int = 0
+    sub_index: int = 0
+
 class Cache:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.parts_dir = self.path.parent / f"{self.path.stem}_parts"
-        self.items = {}
-        self.lock = threading.Lock()
-        self._load()
+    def __init__(self, path: Path):
+        self.path = path
+        self.items: dict[str, dict] = {}
+        self.load()
 
-    def _load(self):
-        if self.parts_dir.exists():
-            part_files = sorted(self.parts_dir.glob("*.json"))
-            if part_files:
-                loaded = 0
-                for p in part_files:
-                    try:
-                        data = json.loads(p.read_text(encoding="utf-8"))
-                        items = data.get("items", {})
-                        if isinstance(items, dict):
-                            self.items.update(items)
-                            loaded += 1
-                    except Exception as e:
-                        print(f"[!] кэш-часть {p.name} не прочитана: {e}")
-                if loaded:
-                    print(f"[i] кэш собран из {loaded} частей ({len(self.items)} записей)")
-                return
+    def load(self):
         if self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                self.items = data.get("items", {}) or {}
-            except Exception as e:
-                print(f"[!] кэш не прочитан: {e}")
+                if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
+                    self.items = data.get("items", {})
+            except Exception:
+                pass
 
     def save(self):
-        payload = {"version": CACHE_VERSION, "updated": _now(), "items": self.items}
-        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        size = len(serialized.encode("utf-8"))
+        try:
+            self.path.write_text(json.dumps({"version": CACHE_VERSION, "items": self.items},
+                                            ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            pass
 
-        if size <= CACHE_SPLIT_THRESHOLD_BYTES:
-            tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            tmp.replace(self.path)
-            if self.parts_dir.exists():
-                for p in self.parts_dir.glob("*.json"):
-                    try: p.unlink()
-                    except Exception: pass
-                try: self.parts_dir.rmdir()
-                except Exception: pass
-            print(f"[i] кэш сохранён: {self.path} "
-                  f"({size/1024/1024:.1f} MB, {len(self.items)} записей)")
-            return
-
-        self.parts_dir.mkdir(exist_ok=True)
-        for p in self.parts_dir.glob("*.json"):
-            try: p.unlink()
-            except Exception: pass
-
-        target_bytes = int(CACHE_SPLIT_THRESHOLD_BYTES * 0.85)
-        overhead = 256
-
-        items_with_size = []
-        for k, v in self.items.items():
-            sz = len(json.dumps({k: v}, ensure_ascii=False,
-                                separators=(",", ":")).encode("utf-8"))
-            items_with_size.append((k, v, sz))
-
-        chunks = []
-        current = {}
-        current_size = 0
-        for k, v, sz in items_with_size:
-            if (current_size + sz + overhead) > target_bytes and current:
-                chunks.append(current)
-                current = {k: v}
-                current_size = sz
-            else:
-                current[k] = v
-                current_size += sz
-        if current: chunks.append(current)
-
-        for i, chunk in enumerate(chunks):
-            part_path = self.parts_dir / f"part_{i:03d}.json"
-            part_path.write_text(json.dumps({
-                "version": CACHE_VERSION, "updated": _now(),
-                "part": i, "total_parts": len(chunks), "items": chunk,
-            }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-
-        if self.path.exists():
-            try: self.path.unlink()
-            except Exception: pass
-
-        part_sizes = sum(p.stat().st_size for p in self.parts_dir.glob("*.json"))
-        print(f"[i] кэш разбит на {len(chunks)} частей в {self.parts_dir}/ "
-              f"({size/1024/1024:.1f} MB → {part_sizes/1024/1024:.1f} MB)")
-
-    def upsert(self, pr, result, sub_index):
+    def upsert(self, pr: Proxy, result: dict, sub_index: int):
         key = pr.dedup_key()
-        with self.lock:
-            it = self.items.get(key)
-            if not it:
-                it = {"kind": pr.kind, "params": dict(pr.params),
-                      "name": pr.name, "raw": pr.raw or dump_to_uri(pr),
-                      "status": "unworking", "first_sub_index": sub_index,
-                      "latency": None, "latency_keepalive": None,
-                      "download_mbps": None, "upload_mbps": None,
-                      "country_code": "", "country": "",
-                      "ip": None, "test_url": None, "error": None,
-                      "elapsed": None,
-                      "first_seen": _now(), "last_checked": None,
-                      "last_working": None, "fail_count": 0, "aliases": [],
-                      "consecutive_ok": 0, "total_checks": 0, "total_ok": 0,
-                      "first_working": None}
-            else:
-                if pr.raw: it["raw"] = pr.raw
-                if pr.name and pr.name != it.get("name"):
-                    al = it.setdefault("aliases", [])
-                    if it["name"] and it["name"] not in al: al.append(it["name"])
-                    if pr.name not in al: al.append(pr.name)
-                    it["name"] = pr.name
-                if "first_sub_index" not in it: it["first_sub_index"] = sub_index
-                it.setdefault("consecutive_ok", 0)
-                it.setdefault("total_checks", 0)
-                it.setdefault("total_ok", 0)
-                it.setdefault("first_working", None)
-                it.setdefault("first_seen", _now())
+        now = _now()
+        if key not in self.items:
+            self.items[key] = {
+                "raw": pr.raw, "kind": pr.kind, "params": pr.params, "name": pr.name,
+                "status": "unknown", "first_seen": now, "check_count": 0, "fail_count": 0,
+                "consecutive_fails": 0, "consecutive_successes": 0, "sub_index": sub_index,
+            }
+        it = self.items[key]
+        it["last_checked"] = now
+        it["check_count"] += 1
+        it["sub_index"] = sub_index
+        
+        if result["ok"]:
+            it["status"] = "working"
+            it["consecutive_fails"] = 0
+            it["consecutive_successes"] += 1
+            it["fail_count"] = 0
+            for k in ("latency", "latency_keepalive", "download_mbps", "upload_mbps",
+                      "ip", "country_code", "country", "test_url", "elapsed"):
+                if k in result and result[k] is not None:
+                    it[k] = result[k]
+        else:
+            it["status"] = "unworking"
+            it["consecutive_successes"] = 0
+            it["consecutive_fails"] += 1
+            it["fail_count"] += 1
+            it["error"] = result.get("error", "")[:100]
 
-            it["last_checked"] = _now()
-            it["latency"] = result.get("latency")
-            it["latency_keepalive"] = result.get("latency_keepalive")
-            it["download_mbps"] = result.get("download_mbps")
-            it["upload_mbps"] = result.get("upload_mbps")
-            it["ip"] = result.get("ip")
-            it["error"] = result.get("error")
-            it["elapsed"] = result.get("elapsed")
-            it["country_code"] = result.get("country_code") or it.get("country_code", "") or ""
-            it["country"]      = result.get("country")      or it.get("country", "")      or ""
-            it["test_url"]     = result.get("test_url")
+    def to_proxy(self, it: dict) -> Proxy:
+        return Proxy(raw=it.get("raw", ""), kind=it.get("kind", ""),
+                     params=it.get("params", {}), name=it.get("name", ""))
 
-            it["total_checks"] = int(it.get("total_checks", 0)) + 1
-            if result.get("ok"):
-                it["status"] = "working"
-                it["last_working"] = _now()
-                it["fail_count"] = 0
-                it["consecutive_ok"] = int(it.get("consecutive_ok", 0)) + 1
-                it["total_ok"] = int(it.get("total_ok", 0)) + 1
-                if not it.get("first_working"): it["first_working"] = it["last_working"]
-            else:
-                it["status"] = "unworking"
-                it["fail_count"] = int(it.get("fail_count", 0)) + 1
-                it["consecutive_ok"] = 0
-            self.items[key] = it
-            return it
-
-    def to_proxy(self, item):
-        return Proxy(raw=item.get("raw", ""), kind=item.get("kind", ""),
-                     params=item.get("params") or {}, name=item.get("name", ""))
-
-    def working_all(self):
-        return [self.to_proxy(v) for v in self.items.values()
-                if v.get("status") == "working" and v.get("params", {}).get("server")]
-
-    def unworking_all(self):
-        return [self.to_proxy(v) for v in self.items.values()
-                if v.get("status") == "unworking" and v.get("params", {}).get("server")]
-
-    def working_by_first_sub(self):
-        m = {}
-        for v in self.items.values():
-            if v.get("status") == "working" and v.get("params", {}).get("server"):
-                m.setdefault(v.get("first_sub_index", 0), []).append(self.to_proxy(v))
-        return m
-
-    def is_stable(self, item, min_checks=3, min_rate=0.8, min_consecutive=2, recent_hours=72):
-        if not item or item.get("status") != "working": return False
-        total = int(item.get("total_checks", 0)); ok = int(item.get("total_ok", 0))
-        if total < min_checks or ok < min_checks: return False
-        if total > 0 and (ok / total) < min_rate: return False
-        if int(item.get("consecutive_ok", 0)) < min_consecutive: return False
-        lw = item.get("last_working")
-        if not lw: return False
-        try:
-            dt = datetime.strptime(lw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - dt).total_seconds() > recent_hours * 3600:
-                return False
-        except Exception: return False
-        return True
-
-    def stable_all(self, min_checks=3, min_rate=0.8, min_consecutive=2, recent_hours=72):
-        return [self.to_proxy(v) for v in self.items.values()
-                if self.is_stable(v, min_checks=min_checks, min_rate=min_rate,
-                                  min_consecutive=min_consecutive, recent_hours=recent_hours)
-                and v.get("params", {}).get("server")]
-
-    def is_new(self, item, recent_hours=24.0):
-        if not item or item.get("status") != "working": return False
-        fs = item.get("first_seen")
-        if not fs: return False
-        try:
-            dt = datetime.strptime(fs, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except Exception: return False
-        return (datetime.now(timezone.utc) - dt).total_seconds() <= recent_hours * 3600
-
-    def new_all(self, recent_hours=24.0):
-        return [self.to_proxy(v) for v in self.items.values()
-                if self.is_new(v, recent_hours=recent_hours)
-                and v.get("params", {}).get("server")]
-
-    def classify(self, item, stable_cfg=None, new_cfg=None):
-        if not item: return "regular"
-        if (new_cfg and new_cfg.get("enabled", True)
-                and self.is_new(item, recent_hours=new_cfg.get("recent_hours", 24))):
-            return "new"
-        if (stable_cfg and stable_cfg.get("enabled", True)
-                and self.is_stable(item,
-                    min_checks=stable_cfg.get("min_checks", 3),
-                    min_rate=stable_cfg.get("min_rate", 0.8),
-                    min_consecutive=stable_cfg.get("min_consecutive", 2),
-                    recent_hours=stable_cfg.get("recent_hours", 72))):
-            return "stable"
+    def classify(self, it: dict, stable_cfg: dict, new_cfg: dict) -> str:
+        if new_cfg.get("enabled", True):
+            try:
+                last = datetime.fromisoformat(it.get("last_checked", "").replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - last).total_seconds() < new_cfg["recent_hours"] * 3600:
+                    return "new"
+            except Exception:
+                pass
+        if stable_cfg.get("enabled", True):
+            if it.get("check_count", 0) >= stable_cfg["min_checks"]:
+                rate = (it.get("consecutive_successes", 0) /
+                        max(1, it.get("consecutive_successes", 0) + it.get("consecutive_fails", 0)))
+                if rate >= stable_cfg["min_rate"] and it.get("consecutive_successes", 0) >= stable_cfg["min_consecutive"]:
+                    return "stable"
         return "regular"
 
-    def is_blacklisted(self, item):
-        if not item: return False
-        if item.get("status") != "unworking": return False
-        return int(item.get("fail_count", 0)) >= BLACKLIST_FAIL_THRESHOLD
+    def working_all(self) -> List[Proxy]:
+        return [self.to_proxy(v) for v in self.items.values() if v.get("status") == "working"]
 
-    def blacklisted_keys(self):
-        return {k for k, v in self.items.items() if self.is_blacklisted(v)}
+    def working_by_first_sub(self) -> dict[int, List[Proxy]]:
+        res = defaultdict(list)
+        for v in self.items.values():
+            if v.get("status") == "working":
+                res[v.get("sub_index", 0)].append(self.to_proxy(v))
+        return res
 
-    def blacklisted_items(self):
-        return [v for v in self.items.values() if self.is_blacklisted(v)]
-
-# ============================================================================
-# Xray Manager
-# ============================================================================
-def _download(url, dest, attempts=3, timeout=120):
-    for i in range(1, attempts + 1):
-        try:
-            with requests.get(url, stream=True, timeout=(15, timeout),
-                              headers={"User-Agent": USER_AGENT}) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("Content-Length", 0))
-                got = 0
-                with dest.open("wb") as f:
-                    for chunk in r.iter_content(65536):
-                        if not chunk: continue
-                        f.write(chunk)
-                        got += len(chunk)
-                        if total:
-                            pct = int(got * 100 / total)
-                            print(f"\r    [{i}/{attempts}] {pct}% "
-                                  f"({got//1024}/{total//1024} KiB)",
-                                  end="", flush=True)
-                print(flush=True)
-                if total and got < total:
-                    raise IOError(f"incomplete {got}/{total}")
-            return True
-        except Exception as e:
-            print(f"\n    [!] попытка {i}/{attempts}: "
-                  f"{type(e).__name__}: {e}", flush=True)
-            if dest.exists():
-                try: dest.unlink()
-                except Exception: pass
-            if i < attempts: time.sleep(3)
-    return False
-
-class XrayManager:
-    def __init__(self, work_dir="xray_bin"):
-        self.dir = Path(work_dir)
-        self.dir.mkdir(exist_ok=True)
-        name = "xray.exe" if platform.system() == "Windows" else "xray"
-        self.bin = self.dir / name
-
-    def _asset(self):
-        s = platform.system(); a = platform.machine().lower()
-        if s == "Windows":
-            if a in ("amd64", "x86_64"):  return "Xray-windows-64.zip"
-            if a in ("arm64", "aarch64"): return "Xray-windows-arm64-v8a.zip"
-            return "Xray-windows-32.zip"
-        if s == "Linux":
-            return "Xray-linux-arm64-v8a.zip" if a in ("aarch64", "arm64") else "Xray-linux-64.zip"
-        if s == "Darwin":
-            return "Xray-macos-arm64-v8a.zip" if a in ("aarch64", "arm64") else "Xray-macos-64.zip"
-        raise RuntimeError(f"{s} {a}")
-
-    def ensure(self):
-        if self.bin.exists():
-            print(f"[xray] готов: {self.bin}")
-            return self.bin
-        asset = self._asset()
-        urls = [f"https://github.com/XTLS/Xray-core/releases/latest/download/{asset}",
-                f"https://github.com/XTLS/Xray-core/releases/download/v1.8.24/{asset}"]
-        z = self.dir / asset
-        ok = False
-        for u in urls:
-            print(f"[xray] скачиваю: {u}", flush=True)
-            if _download(u, z):
-                ok = True
-                break
-        if not ok:
-            raise RuntimeError("Xray не скачался")
-        try:
-            with zipfile.ZipFile(z) as zf:
-                zf.extractall(self.dir)
-        finally:
-            try: z.unlink()
-            except Exception: pass
-        if not self.bin.exists():
-            for p in self.dir.iterdir():
-                if p.is_file() and p.stem.lower() == "xray":
-                    p.rename(self.bin)
-                    break
-        if not self.bin.exists():
-            raise RuntimeError("xray не найден после распаковки")
-        if platform.system() != "Windows":
-            self.bin.chmod(self.bin.stat().st_mode | stat.S_IEXEC)
-        print(f"[xray] готов: {self.bin}")
-        return self.bin
-
-    def run(self, cfg):
-        kw = {}
-        if platform.system() == "Windows":
-            kw["creationflags"] = _sp.CREATE_NO_WINDOW
-        return _sp.Popen([str(self.bin), "run", "-config", str(cfg)],
-                         stdout=_sp.PIPE, stderr=_sp.PIPE,
-                         stdin=_sp.DEVNULL, **kw)
-
-# ─── Порт-менеджер без race condition ───
-_PORT_LOCK = threading.Lock()
-_used_ports: Set[int] = set()
-
-def _free_port():
-    with _PORT_LOCK:
-        for _ in range(2000):
-            p = random.randint(20000, 60000)
-            if p in _used_ports:
-                continue
-            _used_ports.add(p)
-            return p
-    raise RuntimeError("не нашёл свободный порт")
-
-def _release_port(port):
-    with _PORT_LOCK:
-        _used_ports.discard(port)
-
-def _wait_port(port, timeout=6.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            with socket.create_connection(("127.0.0.1", port), 0.3):
-                return True
-        except OSError:
-            time.sleep(0.05)
-    return False
-
-# ============================================================================
-# Checker
-# ============================================================================
-def _get_iface_ip(name):
-    try: import psutil
-    except ImportError: return None
-    addrs = psutil.net_if_addrs()
-    if name not in addrs: return None
-    for a in addrs[name]:
-        if a.family == socket.AF_INET and not a.address.startswith(("127.", "169.254.")):
-            return a.address
-    return None
-
-def _stream_settings(p):
-    net = (p.get("network") or "tcp").lower()
-    sec = (p.get("security") or "").lower()
-    extra = p.get("extra") or {}
-    ss = {"network": net}
-    if net == "ws":
-        ws = {"path": p.get("path", "/") or "/"}
-        if p.get("host"): ws["headers"] = {"Host": p["host"]}
-        ss["wsSettings"] = ws
-    elif net == "grpc":
-        g = {}
-        if p.get("serviceName"): g["serviceName"] = p["serviceName"]
-        if p.get("host"):        g["authority"] = p["host"]
-        ss["grpcSettings"] = g
-    elif net == "httpupgrade":
-        hu = {"path": p.get("path", "/") or "/"}
-        if p.get("host"): hu["host"] = p["host"]
-        ss["httpupgradeSettings"] = hu
-    elif net == "xhttp":
-        xh = {"path": p.get("path", "/") or "/",
-              "mode": p.get("mode", "") or "auto"}
-        if p.get("host"): xh["host"] = p["host"]
-        if extra: xh["extra"] = extra
-        ss["xhttpSettings"] = xh
-    elif net == "tcp" and p.get("headerType") == "http":
-        ss["tcpSettings"] = {"header": {"type": "http",
-            "request": {"path": [p.get("path", "/") or "/"],
-                        "headers": {"Host": [p["host"]] if p.get("host") else []}}}}
-    if sec == "tls":
-        ss["security"] = "tls"
-        tls = {}
-        if p.get("sni"): tls["serverName"] = p["sni"]
-        if p.get("fp"):  tls["fingerprint"] = p["fp"]
-        if p.get("alpn"): tls["alpn"] = [a for a in p["alpn"].split(",") if a]
-        if p.get("allowInsecure"): tls["allowInsecure"] = True
-        ss["tlsSettings"] = tls
-    elif sec == "reality":
-        ss["security"] = "reality"
-        rs = {"show": False, "fingerprint": p.get("fp") or "chrome",
-              "spiderX": p.get("spx") or "/"}
-        if p.get("sni"): rs["serverName"] = p["sni"]
-        if p.get("pbk"): rs["publicKey"] = p["pbk"]
-        if p.get("sid"): rs["shortId"] = p["sid"]
-        ss["realitySettings"] = rs
-    return ss
-
-def _outbound(pr):
-    p = pr.params; k = pr.kind
-    if k == "vless":
-        u = {"id": p.get("uuid", ""), "encryption": "none"}
-        if p.get("flow"): u["flow"] = p["flow"]
-        return {"protocol": "vless",
-                "settings": {"vnext": [{"address": p["server"], "port": p["port"],
-                                        "users": [u]}]},
-                "streamSettings": _stream_settings(p)}
-    if k == "vmess":
-        return {"protocol": "vmess",
-                "settings": {"vnext": [{"address": p["server"], "port": p["port"],
-                    "users": [{"id": p.get("uuid", ""),
-                               "alterId": p.get("alterId", 0),
-                               "security": p.get("cipher", "auto")}]}]},
-                "streamSettings": _stream_settings(p)}
-    if k == "trojan":
-        return {"protocol": "trojan",
-                "settings": {"servers": [{"address": p["server"], "port": p["port"],
-                                          "password": p.get("password", "")}]},
-                "streamSettings": _stream_settings(p)}
-    if k == "ss":
-        return {"protocol": "shadowsocks",
-                "settings": {"servers": [{"address": p["server"], "port": p["port"],
-                                          "method": p.get("method", ""),
-                                          "password": p.get("password", "")}]}}
-    raise ValueError(k)
-
-def _parse_country_response(name, data):
-    if not isinstance(data, dict): return "", "", ""
-    try:
-        if name == "ip-api" and data.get("status") == "success":
-            return data.get("countryCode", ""), data.get("country", ""), data.get("query", "")
-        if name == "ipwho" and data.get("success"):
-            return data.get("country_code", ""), data.get("country", ""), data.get("ip", "")
-        if name == "ipapi-co" and data.get("country_code"):
-            return data.get("country_code", ""), data.get("country_name", ""), data.get("ip", "")
-        if name == "ipinfo" and data.get("country"):
-            return data.get("country", ""), data.get("country", ""), data.get("ip", "")
-    except Exception: pass
-    return "", "", ""
-
-def _detect_country(session, timeout):
-    for url, name in COUNTRY_SOURCES:
-        if not _COUNTRY_SEM.acquire(timeout=timeout): continue
-        try:
+    def stable_all(self, min_checks: int, min_rate: float, min_consecutive: int, recent_hours: float) -> List[Proxy]:
+        out = []
+        now = datetime.now(timezone.utc)
+        for v in self.items.values():
+            if v.get("status") != "working": continue
+            if v.get("check_count", 0) < min_checks: continue
+            if v.get("consecutive_successes", 0) < min_consecutive: continue
+            rate = v.get("consecutive_successes", 0) / max(1, v.get("consecutive_successes", 0) + v.get("consecutive_fails", 0))
+            if rate < min_rate: continue
             try:
-                r = session.get(url, timeout=timeout)
-                if r.status_code == 200:
-                    cc, cn, ip = _parse_country_response(name, r.json())
-                    if cc: return cc, cn, ip
-            except Exception: pass
-        finally:
-            _COUNTRY_SEM.release()
-    return "", "", ""
+                last = datetime.fromisoformat(v.get("last_checked", "").replace("Z", "+00:00"))
+                if (now - last).total_seconds() > recent_hours * 3600:
+                    continue
+            except Exception:
+                continue
+            out.append(self.to_proxy(v))
+        return out
 
+    def new_all(self, recent_hours: float) -> List[Proxy]:
+        out = []
+        now = datetime.now(timezone.utc)
+        for v in self.items.values():
+            if v.get("status") != "working": continue
+            try:
+                first = datetime.fromisoformat(v.get("first_seen", "").replace("Z", "+00:00"))
+                if (now - first).total_seconds() <= recent_hours * 3600:
+                    out.append(self.to_proxy(v))
+            except Exception:
+                continue
+        return out
+
+    def unworking_all(self) -> List[Proxy]:
+        return [self.to_proxy(v) for v in self.items.values() if v.get("status") == "unworking"]
+
+    def blacklisted_keys(self) -> Set[str]:
+        return {k for k, v in self.items.items() if v.get("fail_count", 0) >= BLACKLIST_FAIL_THRESHOLD}
+
+    def blacklisted_items(self) -> List[dict]:
+        return [v for v in self.items.values() if v.get("fail_count", 0) >= BLACKLIST_FAIL_THRESHOLD]
+
+    def is_blacklisted(self, it: dict) -> bool:
+        return it.get("fail_count", 0) >= BLACKLIST_FAIL_THRESHOLD
+
+# ============================================================================
+# Проверка прокси (ИСПРАВЛЕНА СТРУКТУРА JSON И ДЕФОЛТНЫЕ ПАРАМЕТРЫ)
+# ============================================================================
 def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 prior_cc="", server_timeout=None,
-                speed_test=True, speed_timeout=5.0,
-                min_down=0.05, min_up=0.02, require_upload=True):
+                speed_test=False, speed_timeout=5.0,
+                min_down=0.05, min_up=0.02, require_upload=False):
     budget = server_timeout if server_timeout is not None else SERVER_TIMEOUT_DEFAULT
     t_start = time.time()
-
     def remaining():
         return max(0.0, budget - (time.time() - t_start))
-
+    
     port = _free_port()
     ob = _outbound(pr)
     if send_through:
         ob.setdefault("streamSettings", {}).setdefault("sockopt", {})["sendThrough"] = send_through
-    cfg = {"log": {"loglevel": "warning"},
-           "dns": {"queryStrategy": "UseIP",
-                   "servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]},
-           "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks",
-                         "settings": {"auth": "noauth", "udp": False}}],
-           "outbounds": [ob]}
-
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
-                                     encoding="utf-8") as f:
+    
+    # ИСПРАВЛЕНИЕ: inbounds и outbounds вынесены на верхний уровень, а не внутрь dns
+    cfg = {
+        "log": {"loglevel": "warning"},
+        "dns": {
+            "queryStrategy": "UseIP",
+            "servers": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+        },
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": port,
+            "protocol": "socks",
+            "settings": {"auth": "noauth", "udp": False}
+        }],
+        "outbounds": [ob]
+    }
+    
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False)
-        cp = Path(f.name)
-
+    cp = Path(f.name)
     proc = None
     try:
         proc = xray.run(cp)
@@ -1528,22 +1086,23 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 _, e = proc.communicate(timeout=1)
                 if e:
                     lines = e.decode("utf-8", "replace").strip().splitlines()
-                    if lines: msg = " | ".join(lines[-2:])[:180]
-            except Exception: pass
+                    if lines:
+                        msg = " | ".join(lines[-2:])[:180]
+            except Exception:
+                pass
             return {"ok": False, "latency": None, "latency_keepalive": None,
                     "download_mbps": None, "upload_mbps": None,
                     "ip": None, "country_code": "", "country": "",
                     "test_url": None, "error": msg,
                     "elapsed": round(time.time() - t_start, 2)}
-
+        
         session = requests.Session()
         session.proxies = {"http": f"socks5h://127.0.0.1:{port}",
                            "https": f"socks5h://127.0.0.1:{port}"}
-        session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*",
-                                "Connection": "keep-alive"})
+        session.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*", "Connection": "keep-alive"})
         session.mount("http://", HTTPAdapter(max_retries=0))
         session.mount("https://", HTTPAdapter(max_retries=0))
-
+        
         lat = None; working_url = None; last_err = "нет ответа"
         for url in TEST_URLS_FALLBACK:
             req_budget = min(remaining(), timeout)
@@ -1560,7 +1119,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
             except requests.exceptions.RequestException as e:
                 last_err = str(e)[:60]
                 continue
-
+        
         if working_url is None:
             session.close()
             return {"ok": False, "latency": None, "latency_keepalive": None,
@@ -1568,7 +1127,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                     "ip": None, "country_code": "", "country": "",
                     "test_url": None, "error": last_err,
                     "elapsed": round(time.time() - t_start, 2)}
-
+        
         lat_ka = None
         ka_budget = min(remaining(), timeout)
         if ka_budget > 0.3:
@@ -1578,15 +1137,19 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 lat_ka = int((time.perf_counter() - t0) * 1000)
                 if r2.status_code not in (200, 204, 301, 302):
                     lat_ka = None
-            except Exception: lat_ka = None
-
+            except Exception:
+                lat_ka = None
+        
         down_mbps = None; up_mbps = None
         if speed_test:
             down_mbps = _measure_download_speed(session, speed_timeout)
-            if require_upload: up_mbps = _measure_upload_speed(session, speed_timeout)
+            if require_upload:
+                up_mbps = _measure_upload_speed(session, speed_timeout)
+            
             speed_ok = (down_mbps is not None and down_mbps >= min_down)
             if require_upload:
                 speed_ok = speed_ok and (up_mbps is not None and up_mbps >= min_up)
+            
             if not speed_ok:
                 session.close()
                 err = (f"dead/too slow: ↓{down_mbps} ↑{up_mbps} Mbps "
@@ -1596,24 +1159,28 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                         "ip": None, "country_code": "", "country": "",
                         "test_url": working_url, "error": err,
                         "elapsed": round(time.time() - t_start, 2)}
-
+        
         cc, cn, ip = "", "", ""
         country_budget = min(remaining(), 3.0)
         if prior_cc:
             cc = prior_cc
-            if country_budget > 0.3:
-                try:
-                    r = session.get(IP_URL, timeout=country_budget)
-                    if r.status_code == 200: ip = r.text.strip()
-                except Exception: pass
+        if country_budget > 0.3:
+            try:
+                r = session.get(IP_URL, timeout=country_budget)
+                if r.status_code == 200:
+                    ip = r.text.strip()
+            except Exception:
+                pass
         elif country_budget > 0.3:
             cc, cn, ip = _detect_country(session, country_budget)
             if not ip and remaining() > 0.3:
                 try:
                     r = session.get(IP_URL, timeout=min(remaining(), 2.0))
-                    if r.status_code == 200: ip = r.text.strip()
-                except Exception: pass
-
+                    if r.status_code == 200:
+                        ip = r.text.strip()
+                except Exception:
+                    pass
+        
         session.close()
         return {"ok": True, "latency": lat, "latency_keepalive": lat_ka,
                 "download_mbps": down_mbps, "upload_mbps": up_mbps,
@@ -1622,12 +1189,143 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None,
                 "elapsed": round(time.time() - t_start, 2)}
     finally:
         if proc:
-            try: proc.terminate(); proc.wait(2)
+            try:
+                proc.terminate(); proc.wait(2)
             except Exception:
-                try: proc.kill()
-                except Exception: pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         cp.unlink(missing_ok=True)
         _release_port(port)
+
+# ============================================================================
+# Вспомогательные функции для Xray и портов
+# ============================================================================
+_PORT_POOL = set()
+_PORT_LOCK = threading.Lock()
+
+def _free_port():
+    with _PORT_LOCK:
+        for _ in range(100):
+            p = random.randint(10000, 60000)
+            if p not in _PORT_POOL:
+                _PORT_POOL.add(p)
+                return p
+        return 0
+
+def _release_port(port):
+    with _PORT_LOCK:
+        _PORT_POOL.discard(port)
+
+def _wait_port(port: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            time.sleep(0.05)
+    return False
+
+def _get_iface_ip(iface_name: str) -> Optional[str]:
+    import psutil
+    try:
+        addrs = psutil.net_if_addrs().get(iface_name, [])
+        for addr in addrs:
+            if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                return addr.address
+    except Exception:
+        pass
+    return None
+
+def _outbound(pr: Proxy) -> dict:
+    if pr.kind == "vless":
+        user = {"id": pr.params["uuid"], "encryption": "none"}
+        if pr.params.get("flow"): user["flow"] = pr.params["flow"]
+        return {"protocol": "vless", "settings": {"vnext": [{"address": pr.params["server"], "port": pr.params["port"], "users": [user]}]},
+                "streamSettings": _stream(pr)}
+    elif pr.kind == "trojan":
+        return {"protocol": "trojan", "settings": {"servers": [{"address": pr.params["server"], "port": pr.params["port"], "password": pr.params["password"]}]},
+                "streamSettings": _stream(pr)}
+    elif pr.kind == "hysteria2":
+        return {"protocol": "hysteria2", "settings": {"servers": [{"address": pr.params["server"], "port": pr.params["port"], "password": pr.params["password"]}]},
+                "streamSettings": _stream(pr)}
+    return {}
+
+def _stream(pr: Proxy) -> dict:
+    p = pr.params
+    net = (p.get("network") or "tcp").lower()
+    sec = (p.get("security") or "none").lower()
+    st = {"network": net}
+    
+    if net == "ws":
+        ws = {"path": p.get("path") or "/"}
+        if p.get("host"): ws["headers"] = {"Host": p["host"]}
+        st["wsSettings"] = ws
+    elif net == "grpc":
+        st["grpcSettings"] = {"serviceName": p.get("serviceName") or p.get("path") or ""}
+        
+    if sec == "tls":
+        tls = {"serverName": p.get("sni") or p.get("host") or pr.params["server"], "allowInsecure": p.get("insecure", False)}
+        if p.get("fp"): tls["fingerprint"] = p["fp"]
+        if p.get("alpn"): tls["alpn"] = p["alpn"].split(",") if isinstance(p["alpn"], str) else p["alpn"]
+        st["security"] = "tls"
+        st["tlsSettings"] = tls
+    elif sec == "reality":
+        st["security"] = "reality"
+        st["realitySettings"] = {
+            "serverName": p.get("sni") or pr.params["server"],
+            "fingerprint": p.get("fp") or "chrome",
+            "publicKey": p.get("pbk") or "",
+            "shortId": p.get("sid") or "",
+        }
+    else:
+        st["security"] = "none"
+    return st
+
+class XrayManager:
+    def __init__(self, xray_dir: str):
+        self.dir = Path(xray_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.exe = self.dir / ("xray.exe" if platform.system() == "Windows" else "xray")
+
+    def ensure(self):
+        if self.exe.exists():
+            return
+        print("[i] Скачиваю Xray Core...")
+        sys_arch = platform.machine().lower()
+        if "arm" in sys_arch or "aarch" in sys_arch:
+            arch = "arm64-v8a" if "64" in sys_arch else "arm32-v7a"
+            zip_name = "Xray-linux-arm64-v8a.zip" if "64" in sys_arch else "Xray-linux-arm32-v7a.zip"
+        elif "64" in sys_arch or "amd" in sys_arch:
+            arch = "64"
+            zip_name = "Xray-linux-64.zip" if platform.system() != "Windows" else "Xray-windows-64.zip"
+        else:
+            arch = "32"
+            zip_name = "Xray-linux-32.zip" if platform.system() != "Windows" else "Xray-windows-32.zip"
+        
+        url = f"https://github.com/XTLS/Xray-core/releases/latest/download/{zip_name}"
+        zip_path = self.dir / "xray.zip"
+        
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for file in zip_ref.namelist():
+                    if file.lower().endswith("xray") or file.lower().endswith("xray.exe"):
+                        with zip_ref.open(file) as src, open(self.exe, 'wb') as dst:
+                            dst.write(src.read())
+            zip_path.unlink()
+            if platform.system() != "Windows":
+                os.chmod(self.exe, stat.S_IRWXU)
+            print("[i] Xray Core успешно загружен.")
+        except Exception as e:
+            raise RuntimeError(f"Не удалось загрузить Xray: {e}")
+
+    def run(self, cfg_path: Path):
+        return _sp.Popen([str(self.exe), "run", "-c", str(cfg_path)],
+                         stdout=_sp.DEVNULL, stderr=_sp.PIPE, start_new_session=True)
 
 # ============================================================================
 # Отчёты, OutputWriter
@@ -1641,31 +1339,7 @@ def _dedup(proxies):
         seen.add(k); out.append(p)
     return out
 
-def _load_recheck_files(paths):
-    result = []
-    for path_str in paths:
-        path_str = path_str.strip()
-        if not path_str: continue
-        p = Path(path_str)
-        if not p.exists():
-            print(f"[i] recheck: {path_str} — не найден")
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            print(f"[!] recheck: {path_str}: {e}")
-            continue
-        parsed = parse_response_body(text)
-        if not parsed:
-            for u in _extract_uris(text):
-                pr = parse_uri(u)
-                if pr: parsed.append(pr)
-        print(f"[i] recheck: {path_str} → {len(parsed)} серверов")
-        result.extend(parsed)
-    return _dedup(result)
-
-def _build_country_config(cc, cn, servers, cluster="regular",
-                          stable_cfg=None, new_cfg=None):
+def _build_country_config(cc, cn, servers, cluster="regular", stable_cfg=None, new_cfg=None):
     flag = flag_from_cc(cc) if cc else "🏳️"
     name = cn or country_ru(cc)
     mark = marker_for(cluster, stable_cfg, new_cfg)
@@ -1768,13 +1442,6 @@ class OutputWriter:
         self._write_lines(self.allworking / "speeds.txt", lines)
 
     def write_top_fastest(self, cache, count=TOP_FASTEST_COUNT):
-        """
-        Top-N самых быстрых серверов.
-        Сортировка: download_mbps desc, tiebreak latency asc.
-        Серверы без замеренной скорости (--no-speed) идут во второй эшелон
-        и сортируются по пингу.
-        Возвращает (Path, list) или None если данных нет.
-        """
         rows = []
         for v in cache.items.values():
             if v.get("status") != "working":
@@ -2174,6 +1841,26 @@ def _collect_proxies_from_uris(uris):
         p = parse_uri(u)
         if p and p.params.get("server"): out.append(p)
     return out
+
+def _detect_country(session, timeout):
+    with _COUNTRY_SEM:
+        for url, name in COUNTRY_SOURCES:
+            try:
+                r = session.get(url, timeout=timeout)
+                if r.status_code == 200:
+                    data = r.json()
+                    if name == "ip-api":
+                        if data.get("status") == "success":
+                            return data.get("countryCode", ""), data.get("country", ""), data.get("query", "")
+                    elif name == "ipwho":
+                        return data.get("country_code", ""), data.get("country", ""), data.get("ip", "")
+                    elif name == "ipapi-co":
+                        return data.get("country_code", ""), data.get("country_name", ""), data.get("ip", "")
+                    elif name == "ipinfo":
+                        return data.get("country", ""), data.get("country", ""), data.get("ip", "")
+            except Exception:
+                continue
+    return "", "", ""
 
 # ============================================================================
 # main
