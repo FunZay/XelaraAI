@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Combined Source Loader + Xray Checker (полная версия, точная).
+Combined Source Loader + Xray Checker (strict edition).
 
-Возможности:
-  - загрузка подписок: plain / base64 / Clash YAML / Xray JSON / Happ-метод
-  - blacklist источников (после 3 неудач подряд)
-  - парсинг vless / vmess / trojan / hysteria2 (hy2)
-  - проверка через xray: 3 независимых probe-URL (нужно --min-probes),
-    IP выхода подтверждён 2 эхо-сервисами, иначе сервер не считается рабочим
-  - скорость down / up (опционально), двойная проверка, выбрасывание мёртвых
-  - страна входа (DNS-IP сервера) и выхода (IP выхода) по консенсусу геосервисов
-  - каскад = страна входа != страна выхода (оба подтверждены)
-  - стабильные ⚡ и новые 🟢, батчинг, кэш, blacklist серверов
-  - режимы --only-new / --only-old, перепроверка файлов
-  - готовые Xray-конфиги по странам (балансировщик, маршрутизация RU-доменов)
-  - --interface: отправка через конкретный сетевой интерфейс (wifi / mobile)
-  - --eu-fallback: вернуть старое поведение (неизвестную страну считать EU)
+Изменения по сравнению с базовой версией:
+  - HTTPS для всех probe-URL (не HTTP)
+  - content-верификация: тянем https://www.cloudflare.com/cdn-cgi/trace
+    и проверяем поля ip= / warp= / colo=
+  - детект captive portal по паттернам в теле ответа
+  - exit IP подтверждается 2 РАЗНЫМИ echo-сервисами
+  - exit IP и IP из CF-trace должны совпадать
+  - inbound_ip и exit_ip обязаны быть публичными
+  - в output попадают только серверы, проверенные не позже --max-age-hours
+  - --strict: 3/3 probes, content-check, public-IP, min-down 0.5, min-up 0.1,
+    max-age 6h, speed-check
 
 Ограничения:
-  - страна входа берётся из DNS. Если хост за CDN, страна входа = страна CDN
-  - точность геолокации = консенсус внешних геосервисов
+  - страна входа — из DNS (если хост за CDN — страна CDN)
   - hysteria2 obfs (salamander) не передаётся в xray-outbound
 """
 
@@ -52,6 +48,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -108,15 +105,21 @@ CACHE_VERSION = 6
 SERVER_TIMEOUT_DEFAULT = 8.0
 SPEED_UP_BYTES = 500_000
 
+# Глобалы, устанавливаемые из main()
+MAX_AGE_HOURS = 24.0
+MIN_CONSECUTIVE = 1
+
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36 combined/1.0")
 HWID_STATIC = "d060e73eb61d1ba7"
 HAPP_USER_AGENTS = ["Happ/3.18.3/Android/17771400994551771562"]
 
+# ВСЕ probe — по HTTPS. HTTP-вариант (connectivitycheck.gstatic.com) убран,
+# потому что тривиально MITM-ится captive portal'ом.
 PROBE_URLS = [
     "https://www.gstatic.com/generate_204",
     "https://cp.cloudflare.com/generate_204",
-    "http://connectivitycheck.gstatic.com/generate_204",
+    "https://connectivitycheck.gstatic.com/generate_204",
 ]
 ECHO_URLS = [
     ("https://api.ipify.org?format=json", "json"),
@@ -131,6 +134,16 @@ SPEED_DOWN_URLS = [
 ]
 SPEED_UP_URLS = ["https://speed.cloudflare.com/__up", "https://httpbin.org/post"]
 
+# content-верификация: реальная страница с известным содержимым.
+CONTENT_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+CONTENT_PROBE_KEYS = ("ip=", "warp=", "colo=")
+CAPTIVE_PATTERNS = (
+    "captive", "portal", "sign in", "sign-in", "signin", "login", "log in",
+    "welcome to", "you need to", "authenticate", "network access",
+    "hotspot", "accept terms", "agree to", "terms of service",
+    "internet access", "connect to wifi", "wi-fi login",
+)
+
 # (имя, шаблон, минимальный интервал между запросами, сек)
 GEO_PROVIDERS = [
     ("ipwho.is", "https://ipwho.is/{ip}", 1.0),
@@ -142,7 +155,7 @@ GEO_TTL_OK = timedelta(days=30)
 GEO_TTL_UNKNOWN = timedelta(hours=24)
 
 STATUS_MARKERS = {"stable": "⚡", "new": "🟢", "regular": ""}
-EU_FALLBACK = False  # задаётся из --eu-fallback
+EU_FALLBACK = False
 
 VLESS_REGEX = re.compile(r"vless://[^\s#]+", re.IGNORECASE)
 TROJAN_REGEX = re.compile(r"trojan://[^\s#]+", re.IGNORECASE)
@@ -490,7 +503,6 @@ def is_valid_config(url):
 
 
 def extract_uris(text):
-    """Все URI из текста: plain, base64, JSON (Xray), YAML (Clash)."""
     if not text:
         return []
     found = URI_REGEX.findall(text)
@@ -546,7 +558,6 @@ def fetch_source(url):
 
 
 def load_sources():
-    """Возвращает (uris_из_источников, uris_из_my_configs, stats)."""
     print("\n" + "=" * 60)
     print("Скачивание конфигураций из источников")
     print("=" * 60)
@@ -988,7 +999,7 @@ def _measure_upload_speed(session, timeout):
 
 
 # ============================================================================
-# Проверка одного сервера
+# Проверка одного сервера (жёсткая)
 # ============================================================================
 def _resolve_ipv4(host):
     try:
@@ -1001,18 +1012,76 @@ def _resolve_ipv4(host):
     return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
 
 
+def _is_valid_ip(s):
+    if not s or not isinstance(s, str):
+        return False
+    try:
+        ipaddress.ip_address(s.strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_public_ip(s):
+    try:
+        a = ipaddress.ip_address((s or "").strip())
+        return a.is_global and not a.is_multicast
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_captive(text):
+    t = (text or "").lower()[:3000]
+    return any(p in t for p in CAPTIVE_PATTERNS)
+
+
+def _verify_content(session, timeout):
+    """Тянет реальную CF-trace страницу через прокси.
+    Возвращает (cf_ip, None) при успехе или (None, error)."""
+    try:
+        r = session.get(CONTENT_PROBE_URL, timeout=timeout,
+                        allow_redirects=False, stream=False)
+        if r.status_code != 200:
+            return None, f"content HTTP {r.status_code}"
+        text = r.text or ""
+        if _is_captive(text):
+            return None, "captive portal"
+        missing = [k for k in CONTENT_PROBE_KEYS if k not in text]
+        if missing:
+            return None, f"content missing {','.join(missing)}"
+        m = re.search(r"^ip=([0-9a-fA-F.:]+)\s*$", text, re.MULTILINE)
+        cf_ip = m.group(1).strip() if m else ""
+        return cf_ip, None
+    except requests.exceptions.SSLError:
+        return None, "SSL error (MITM?)"
+    except requests.exceptions.RequestException as e:
+        return None, f"content: {str(e)[:80]}"
+
+
 def _echo_exit_ip(session, timeout):
+    """Возвращает exit_ip, если 2 РАЗНЫХ echo-сервиса вернули один и тот же
+    публичный IP. Иначе пустая строка."""
     votes = Counter()
+    sources = defaultdict(set)
     for url, kind in ECHO_URLS:
         try:
             r = session.get(url, timeout=timeout)
             if r.status_code != 200:
                 continue
-            ip = r.json().get("ip", "") if kind == "json" else r.text.strip()
-            if ip and IP_REGEX.fullmatch(ip):
-                votes[ip] += 1
-                if votes[ip] >= 2:
-                    return ip
+            if kind == "json":
+                try:
+                    j = r.json()
+                    ip = j.get("ip", "") if isinstance(j, dict) else ""
+                except Exception:
+                    continue
+            else:
+                ip = r.text.strip()
+            if not _is_valid_ip(ip) or not _is_public_ip(ip):
+                continue
+            votes[ip] += 1
+            sources[ip].add(url)
+            if len(sources[ip]) >= 2:
+                return ip
         except Exception:
             continue
     return ""
@@ -1020,7 +1089,8 @@ def _echo_exit_ip(session, timeout):
 
 def check_proxy(pr, xray, timeout=8.0, send_through=None, server_timeout=None,
                 speed_test=False, speed_timeout=5.0, min_down=0.05, min_up=0.02,
-                require_upload=False, min_probes=2):
+                require_upload=False, min_probes=2,
+                require_content=True, require_public_ip=True):
     budget = server_timeout if server_timeout is not None else SERVER_TIMEOUT_DEFAULT
     t_start = time.time()
 
@@ -1030,6 +1100,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None, server_timeout=None,
     def fail(msg, **extra):
         out = {"ok": False, "latency": None, "download_mbps": None, "upload_mbps": None,
                "exit_ip": "", "inbound_ip": "", "probes_ok": 0, "test_url": None,
+               "content_verified": False,
                "error": msg, "elapsed": round(time.time() - t_start, 2)}
         out.update(extra)
         return out
@@ -1039,6 +1110,10 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None, server_timeout=None,
         inbound_ip = _resolve_ipv4(pr.params.get("server", ""))
     except Exception:
         return fail("dns: не резолвится")
+
+    if require_public_ip and not _is_public_ip(inbound_ip):
+        return fail(f"inbound IP не публичный: {inbound_ip or '?'}",
+                    inbound_ip=inbound_ip)
 
     port = _free_port()
     ob = _outbound(pr)
@@ -1077,6 +1152,7 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None, server_timeout=None,
         session.mount("http://", HTTPAdapter(max_retries=0))
         session.mount("https://", HTTPAdapter(max_retries=0))
 
+        # --- 1) probes ---
         lats, working_url, last_err = [], None, "нет ответа"
         for url in PROBE_URLS:
             req_budget = min(remaining(), timeout)
@@ -1087,9 +1163,15 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None, server_timeout=None,
                 t0 = time.perf_counter()
                 r = session.get(url, timeout=req_budget, allow_redirects=False)
                 dt = int((time.perf_counter() - t0) * 1000)
-                if r.status_code in (200, 204):
-                    lats.append(dt)
-                    working_url = working_url or url
+                if r.status_code == 204 and (r.content or b"") == b"":
+                    lats.append(dt); working_url = working_url or url
+                elif r.status_code == 200:
+                    body = (r.content or b"")[:2000]
+                    txt = body.decode("utf-8", errors="replace") if body else ""
+                    if not _is_captive(txt):
+                        lats.append(dt); working_url = working_url or url
+                    else:
+                        last_err = "captive portal в probe"
                 else:
                     last_err = f"HTTP {r.status_code}"
             except requests.exceptions.RequestException as e:
@@ -1100,46 +1182,72 @@ def check_proxy(pr, xray, timeout=8.0, send_through=None, server_timeout=None,
                         inbound_ip=inbound_ip, probes_ok=len(lats))
 
         latency = int(statistics.median(lats))
-        exit_ip = _echo_exit_ip(session, min(remaining(), timeout)) if remaining() > 0.5 else ""
+
+        # --- 2) exit IP (2 разных echo-сервиса) ---
+        exit_ip = ""
+        if remaining() > 0.5:
+            exit_ip = _echo_exit_ip(session, min(remaining(), timeout))
         if not exit_ip:
-            return fail("IP выхода не подтверждён (2 эхо-сервиса)",
+            return fail("IP выхода не подтверждён (2 разных эхо-сервиса)",
                         inbound_ip=inbound_ip, probes_ok=len(lats), latency=latency,
                         test_url=working_url)
+        if require_public_ip and not _is_public_ip(exit_ip):
+            return fail(f"exit IP не публичный: {exit_ip}",
+                        inbound_ip=inbound_ip, exit_ip=exit_ip,
+                        probes_ok=len(lats), latency=latency, test_url=working_url)
 
+        # --- 3) content verification ---
+        content_ok, cf_ip = False, None
+        if require_content:
+            if remaining() <= 0.5:
+                return fail("content: нет бюджета",
+                            inbound_ip=inbound_ip, exit_ip=exit_ip,
+                            probes_ok=len(lats), latency=latency, test_url=working_url)
+            cf_ip, content_err = _verify_content(session, min(remaining(), timeout))
+            if cf_ip is None:
+                return fail(f"content failed: {content_err}",
+                            inbound_ip=inbound_ip, exit_ip=exit_ip,
+                            probes_ok=len(lats), latency=latency, test_url=working_url)
+            content_ok = True
+            # exit_ip должен совпадать с IP из CF-trace
+            if cf_ip and exit_ip and cf_ip != exit_ip:
+                return fail(f"exit mismatch: echo={exit_ip} cf={cf_ip}",
+                            inbound_ip=inbound_ip, exit_ip=exit_ip,
+                            probes_ok=len(lats), latency=latency, test_url=working_url,
+                            content_verified=True)
+
+        # --- 4) скорость ---
         down = up_mbps = None
-        if speed_test:
-            down = _measure_download_speed(session, speed_timeout)
+        if speed_test and remaining() > 1.0:
+            down = _measure_download_speed(session, min(remaining(), speed_timeout))
             if require_upload:
-                up_mbps = _measure_upload_speed(session, speed_timeout)
+                up_mbps = _measure_upload_speed(session, min(remaining(), speed_timeout))
             speed_ok = down is not None and down >= min_down
             if require_upload:
                 speed_ok = speed_ok and up_mbps is not None and up_mbps >= min_up
             if not speed_ok:
-                return fail(f"dead/too slow: ↓{down} ↑{up_mbps} Mbps (min ↓{min_down} ↑{min_up})",
+                return fail(f"dead/too slow: ↓{down} ↑{up_mbps} Mbps "
+                            f"(min ↓{min_down} ↑{min_up})",
                             inbound_ip=inbound_ip, exit_ip=exit_ip, latency=latency,
                             download_mbps=down, upload_mbps=up_mbps,
-                            probes_ok=len(lats), test_url=working_url)
+                            probes_ok=len(lats), test_url=working_url,
+                            content_verified=content_ok)
 
         return {"ok": True, "latency": latency, "download_mbps": down, "upload_mbps": up_mbps,
                 "exit_ip": exit_ip, "inbound_ip": inbound_ip, "probes_ok": len(lats),
-                "test_url": working_url, "error": None,
+                "test_url": working_url, "content_verified": content_ok, "error": None,
                 "elapsed": round(time.time() - t_start, 2)}
     except Exception as e:
         return fail(f"{type(e).__name__}: {str(e)[:100]}", inbound_ip=inbound_ip)
     finally:
         if proc:
             try:
-                proc.terminate()
-                proc.wait(2)
+                proc.terminate(); proc.wait(2)
             except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        try:
-            os.unlink(cfg_path)
-        except OSError:
-            pass
+                try: proc.kill()
+                except Exception: pass
+        try: os.unlink(cfg_path)
+        except OSError: pass
         _release_port(port)
 
 
@@ -1180,7 +1288,7 @@ class Cache:
             it["error"] = ""
             for k in ("latency", "download_mbps", "upload_mbps", "exit_ip", "inbound_ip",
                       "test_url", "elapsed", "probes_ok", "country_code", "country",
-                      "is_cascade", "cascade_msg"):
+                      "is_cascade", "cascade_msg", "content_verified"):
                 if k in result and result[k] is not None:
                     it[k] = result[k]
         else:
@@ -1209,25 +1317,45 @@ class Cache:
                 return "stable"
         return "regular"
 
-    def working_all(self):
-        return [self.to_proxy(v) for v in self.items.values() if v.get("status") == "working"]
+    @staticmethod
+    def _fresh(v, max_age_hours):
+        if max_age_hours is None:
+            return True
+        try:
+            ts = datetime.fromisoformat(v.get("last_checked", "").replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) - ts < timedelta(hours=max_age_hours)
+        except Exception:
+            return False
 
-    def working_by_first_sub(self):
+    def working_all(self, max_age_hours=None, min_consecutive=1):
+        return [self.to_proxy(v) for v in self.items.values()
+                if v.get("status") == "working"
+                and v.get("consecutive_successes", 0) >= min_consecutive
+                and self._fresh(v, max_age_hours)]
+
+    def working_by_first_sub(self, max_age_hours=None, min_consecutive=1):
         res = defaultdict(list)
         for v in self.items.values():
-            if v.get("status") == "working":
+            if (v.get("status") == "working"
+                    and v.get("consecutive_successes", 0) >= min_consecutive
+                    and self._fresh(v, max_age_hours)):
                 res[v.get("sub_index", 0)].append(self.to_proxy(v))
         return res
 
-    def stable_all(self, stable_cfg):
+    def stable_all(self, stable_cfg, max_age_hours=None, min_consecutive=1):
         return [self.to_proxy(v) for v in self.items.values()
-                if v.get("status") == "working" and stability_ok(v, stable_cfg)]
+                if v.get("status") == "working"
+                and v.get("consecutive_successes", 0) >= min_consecutive
+                and self._fresh(v, max_age_hours)
+                and stability_ok(v, stable_cfg)]
 
-    def new_all(self, recent_hours):
+    def new_all(self, recent_hours, max_age_hours=None, min_consecutive=1):
         out = []
         now = datetime.now(timezone.utc)
         for v in self.items.values():
-            if v.get("status") != "working":
+            if (v.get("status") != "working"
+                    or v.get("consecutive_successes", 0) < min_consecutive
+                    or not self._fresh(v, max_age_hours)):
                 continue
             try:
                 first = datetime.fromisoformat(v.get("first_seen", "").replace("Z", "+00:00"))
@@ -1237,8 +1365,9 @@ class Cache:
                 continue
         return out
 
-    def unworking_all(self):
-        return [self.to_proxy(v) for v in self.items.values() if v.get("status") == "unworking"]
+    def unworking_all(self, max_age_hours=None):
+        return [self.to_proxy(v) for v in self.items.values()
+                if v.get("status") == "unworking" and self._fresh(v, max_age_hours)]
 
     def blacklisted_keys(self):
         return {k for k, v in self.items.items() if v.get("fail_count", 0) >= BLACKLIST_FAIL_THRESHOLD}
@@ -1269,7 +1398,7 @@ def decide_cascade(inbound_ip, exit_ip, in_cc, out_cc):
 
 
 # ============================================================================
-# Геолокация: только консенсус геосервисов
+# Геолокация
 # ============================================================================
 def _parse_geo(name, r):
     try:
@@ -1372,13 +1501,14 @@ def geo_phase(cache, geo, workers):
 
 
 # ============================================================================
-# Параллельная проверка с батчами, двойной проверкой, сбросом мёртвых
+# Параллельная проверка
 # ============================================================================
 def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index, concurrency,
                     server_timeout=SERVER_TIMEOUT_DEFAULT, speed_test=True, speed_timeout=5.0,
                     min_down=0.05, min_up=0.02, require_upload=True, min_probes=2,
                     double_check=True, discard_failed=True, discard_log=DISCARD_FILE,
-                    max_batch=MAX_BATCH_SIZE):
+                    max_batch=MAX_BATCH_SIZE,
+                    require_content=True, require_public_ip=True):
     results = {k: [] for k in ifaces}
     if double_check and discard_failed and discard_log:
         try:
@@ -1419,7 +1549,9 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index, concurrenc
                                     server_timeout=server_timeout, speed_test=speed_test,
                                     speed_timeout=speed_timeout, min_down=min_down,
                                     min_up=min_up, require_upload=require_upload,
-                                    min_probes=min_probes)
+                                    min_probes=min_probes,
+                                    require_content=require_content,
+                                    require_public_ip=require_public_ip)
                     cache.upsert(pr, r, sub_index)
                     with lock:
                         pairs.append((pr, r))
@@ -1482,7 +1614,7 @@ def _check_parallel(proxies, xray, timeout, ifaces, cache, sub_index, concurrenc
 
 
 # ============================================================================
-# Конфиги Xray по странам (балансировщик, маршрутизация)
+# Конфиги Xray по странам
 # ============================================================================
 def _build_country_config(cc, servers, cluster="regular", stable_cfg=None, new_cfg=None):
     flag = flag_of(cc)
@@ -1599,6 +1731,10 @@ class OutputWriter:
                 continue
             if v.get("download_mbps") is None and v.get("latency") is None:
                 continue
+            if not Cache._fresh(v, MAX_AGE_HOURS):
+                continue
+            if v.get("consecutive_successes", 0) < MIN_CONSECUTIVE:
+                continue
             rows.append(v)
         if not rows:
             return None
@@ -1641,6 +1777,10 @@ class OutputWriter:
         groups = defaultdict(list)
         for v in cache.items.values():
             if v.get("status") != "working" or not (v.get("params") or {}).get("server"):
+                continue
+            if not Cache._fresh(v, MAX_AGE_HOURS):
+                continue
+            if v.get("consecutive_successes", 0) < MIN_CONSECUTIVE:
                 continue
             cc = v.get("country_code") or ("EU" if EU_FALLBACK else "UNKNOWN")
             cluster = cache.classify(v, stable_cfg, new_cfg)
@@ -1704,8 +1844,9 @@ class OutputWriter:
 
 def write_report_csv(path, cache):
     fields = ["status", "country", "entry_cc", "exit_cc", "inbound_ip", "exit_ip", "cascade",
-              "latency_ms", "download_mbps", "upload_mbps", "probes_ok", "kind", "name",
-              "server", "port", "first_seen", "last_checked", "history", "error", "raw"]
+              "latency_ms", "download_mbps", "upload_mbps", "probes_ok", "content_verified",
+              "kind", "name", "server", "port", "first_seen", "last_checked", "history",
+              "error", "raw"]
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -1720,6 +1861,7 @@ def write_report_csv(path, cache):
                 "cascade": "" if casc is None else ("yes" if casc else "no"),
                 "latency_ms": v.get("latency", ""), "download_mbps": v.get("download_mbps", ""),
                 "upload_mbps": v.get("upload_mbps", ""), "probes_ok": v.get("probes_ok", ""),
+                "content_verified": v.get("content_verified", ""),
                 "kind": v.get("kind", ""), "name": v.get("name", ""),
                 "server": p.get("server", ""), "port": p.get("port", ""),
                 "first_seen": v.get("first_seen", ""), "last_checked": v.get("last_checked", ""),
@@ -1731,18 +1873,22 @@ def write_report_csv(path, cache):
 def _write_final(cache, writer, sources_count, final_file, stable_cfg, new_cfg,
                  top_fastest_count, geo, brand, out_dir):
     print(f"\n[i] кэш: {len(cache.items)} записей")
+    print(f"[i] фильтр: age≤{MAX_AGE_HOURS}ч, consecutive≥{MIN_CONSECUTIVE}")
     if geo is not None:
         geo_phase(cache, geo, workers=8)
 
     new_window = new_cfg.get("recent_hours", 24.0) if new_cfg and new_cfg.get("enabled", True) else None
-    new_proxies = cache.new_all(new_window) if new_window is not None else []
+    new_proxies = cache.new_all(new_window, max_age_hours=MAX_AGE_HOURS,
+                                min_consecutive=MIN_CONSECUTIVE) if new_window is not None else []
     new_keys = {p.dedup_key() for p in new_proxies}
     stable_proxies = []
     if stable_cfg and stable_cfg.get("enabled", True):
-        stable_proxies = [p for p in cache.stable_all(stable_cfg)
+        stable_proxies = [p for p in cache.stable_all(stable_cfg, max_age_hours=MAX_AGE_HOURS,
+                                                      min_consecutive=MIN_CONSECUTIVE)
                           if new_window is None or p.dedup_key() not in new_keys]
 
-    by_first = cache.working_by_first_sub()
+    by_first = cache.working_by_first_sub(max_age_hours=MAX_AGE_HOURS,
+                                          min_consecutive=MIN_CONSECUTIVE)
     for sub_index in range(1, sources_count + 1):
         lines = [rename_uri(p.raw, _label(cache.items[p.dedup_key()],
                                           cache.classify(cache.items[p.dedup_key()], stable_cfg, new_cfg),
@@ -1750,7 +1896,8 @@ def _write_final(cache, writer, sources_count, final_file, stable_cfg, new_cfg,
                  for p in by_first.get(sub_index, []) if p.dedup_key() in cache.items]
         writer.write_working_for_sub(sub_index, lines)
 
-    all_working = cache.working_all()
+    all_working = cache.working_all(max_age_hours=MAX_AGE_HOURS,
+                                    min_consecutive=MIN_CONSECUTIVE)
     lines_all = []
     for p in all_working:
         it = cache.items[p.dedup_key()]
@@ -1762,6 +1909,10 @@ def _write_final(cache, writer, sources_count, final_file, stable_cfg, new_cfg,
     speed_lines = []
     for v in cache.items.values():
         if v.get("status") != "working":
+            continue
+        if not Cache._fresh(v, MAX_AGE_HOURS):
+            continue
+        if v.get("consecutive_successes", 0) < MIN_CONSECUTIVE:
             continue
         dn, up_ = v.get("download_mbps"), v.get("upload_mbps")
         if dn is None and up_ is None:
@@ -1781,7 +1932,7 @@ def _write_final(cache, writer, sources_count, final_file, stable_cfg, new_cfg,
             print(f"    #{i} {flag_of(v.get('country_code') or 'UNKNOWN')}: "
                   f"↓{v.get('download_mbps')}Mbps ↑{v.get('upload_mbps')}Mbps {v.get('latency')}ms")
 
-    unworking = cache.unworking_all()
+    unworking = cache.unworking_all(max_age_hours=MAX_AGE_HOURS)
     writer.write_unworking_all(unworking)
     blacklisted = cache.blacklisted_items()
     if blacklisted:
@@ -1832,7 +1983,7 @@ def _write_final(cache, writer, sources_count, final_file, stable_cfg, new_cfg,
 # main
 # ============================================================================
 def main():
-    global EU_FALLBACK
+    global EU_FALLBACK, MAX_AGE_HOURS, MIN_CONSECUTIVE
     ap = argparse.ArgumentParser(description="Xray checker: серверы, страны, каскады")
     ap.add_argument("--no-load", action="store_true", help="не качать источники")
     ap.add_argument("-i", "--input", default=CONFIGS_FILE)
@@ -1875,12 +2026,36 @@ def main():
     ap.add_argument("--max-batch", type=int, default=MAX_BATCH_SIZE)
     ap.add_argument("--top-fastest", type=int, default=TOP_FASTEST_COUNT)
     ap.add_argument("--brand", default="@XelaraVpn")
+    # строгость
+    ap.add_argument("--strict", action="store_true",
+                    help="жёсткий режим: 3/3 probes, content-check, public-IP, "
+                         "min-down=0.5, min-up=0.1, max-age=6h")
+    ap.add_argument("--no-content-check", action="store_true",
+                    help="отключить content-верификацию (быстрее, но пропустит captive-порталы)")
+    ap.add_argument("--no-public-ip", action="store_true",
+                    help="не требовать публичный inbound/exit IP")
+    ap.add_argument("--max-age-hours", type=float, default=24.0,
+                    help="включать в output только серверы, проверенные не позже N часов назад")
+    ap.add_argument("--min-consecutive", type=int, default=1,
+                    help="сколько успешных проверок подряд нужно, чтобы сервер попал в output")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--only-new", action="store_true")
     mode.add_argument("--only-old", action="store_true")
     args = ap.parse_args()
 
+    if args.strict:
+        args.min_probes = len(PROBE_URLS)
+        args.min_down = max(args.min_down, 0.5)
+        args.min_up = max(args.min_up, 0.1)
+        args.max_age_hours = min(args.max_age_hours, 6.0)
+        args.no_content_check = False
+        args.no_public_ip = False
+        args.no_speed = False
+        args.keep_failed = False
+
     EU_FALLBACK = args.eu_fallback
+    MAX_AGE_HOURS = args.max_age_hours
+    MIN_CONSECUTIVE = max(1, args.min_consecutive)
     args.concurrency = max(1, min(args.concurrency, MAX_CONCURRENCY))
     args.min_probes = max(1, min(args.min_probes, len(PROBE_URLS)))
     args.max_batch = max(100, args.max_batch)
@@ -1891,6 +2066,8 @@ def main():
         require_upload=not args.no_upload_check, min_probes=args.min_probes,
         double_check=not args.no_double_check, discard_failed=not args.keep_failed,
         discard_log=args.discard_log, max_batch=args.max_batch,
+        require_content=not args.no_content_check,
+        require_public_ip=not args.no_public_ip,
     )
     stable_cfg = {"enabled": not args.no_stable, "min_checks": args.stable_min_checks,
                   "min_rate": args.stable_min_rate, "min_consecutive": args.stable_min_consecutive,
@@ -1917,10 +2094,14 @@ def main():
             sources = [l.strip() for l in src.read_text(encoding="utf-8", errors="replace").splitlines()
                        if l.strip() and not l.strip().startswith("#")]
 
-    print(f"\n[i] режим: {'only-new' if args.only_new else 'only-old' if args.only_old else 'all'}")
+    print(f"\n[i] режим: {'only-new' if args.only_new else 'only-old' if args.only_old else 'all'}"
+          f"{' [STRICT]' if args.strict else ''}")
     print(f"[i] источников: {len(sources)} | параллельно: {args.concurrency} | бюджет: {args.server_timeout}s")
     print(f"[i] probes: {args.min_probes}/{len(PROBE_URLS)} | гео-согласие: {args.geo_min_agree} | "
           f"неизвестная страна: {'EU' if EU_FALLBACK else 'UNKNOWN'}")
+    print(f"[i] content-check: {'ВКЛ' if check_kwargs['require_content'] else 'ВЫКЛ'} | "
+          f"public-IP: {'ВКЛ' if check_kwargs['require_public_ip'] else 'ВЫКЛ'} | "
+          f"max-age: {MAX_AGE_HOURS}ч | min-consecutive: {MIN_CONSECUTIVE}")
     print(f"[i] батч: ≤{args.max_batch} | двойная: {'ВКЛ' if check_kwargs['double_check'] else 'ВЫКЛ'} | "
           f"скорость: {'ВКЛ' if check_kwargs['speed_test'] else 'ВЫКЛ'}")
     print(f"[i] в кэше: {len(cache.items)}")
