@@ -172,15 +172,61 @@ jobs:
 
       - name: 🔄 Trigger Worker Sync
         env:
+          # Админский воркер (обслуживает /api/admin/*).
+          # Не путать с клиентским vpn.xelaravpn.workers.dev — там /api/admin/sync НЕТ.
           WORKER_URL: "https://adminvpn.xelaravpn.workers.dev"
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
         run: |
-          if [ -z "$ADMIN_TOKEN" ]; then
-            echo "⚠️ Пропускаю синхронизацию воркера, так как секрет ADMIN_TOKEN не задан."
-            exit 0
+          set -euo pipefail
+
+          if [ -z "${ADMIN_TOKEN:-}" ]; then
+            echo "::error::Секрет ADMIN_TOKEN не задан. Settings → Secrets and variables → Actions → ADMIN_TOKEN"
+            exit 1
           fi
-          echo "Стучусь в воркер: $WORKER_URL/api/admin/sync"
-          curl -X POST "$WORKER_URL/api/admin/sync" \
+
+          echo "POST $WORKER_URL/api/admin/sync"
+          BODY=$(mktemp)
+          trap 'rm -f "$BODY"' EXIT
+
+          CODE=$(curl -sS -o "$BODY" -w "%{http_code}" \
+            --connect-timeout 15 --max-time 120 \
+            -X POST "$WORKER_URL/api/admin/sync" \
             -H "X-Token: $ADMIN_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "{}"
+            -d "{}" || echo "000")
+
+          echo "── HTTP $CODE ──"
+          echo "Response body:"
+          head -c 8000 "$BODY" || true
+          echo
+          echo "── end ──"
+
+          case "$CODE" in
+            200)
+              echo "✅ Синк выполнен"
+              ;;
+            000)
+              echo "::error::Не удалось подключиться к $WORKER_URL (DNS/сеть/Cloudflare 1042?)"
+              exit 1
+              ;;
+            401)
+              echo "::error::HTTP 401 — ADMIN_TOKEN невалиден или не найден в p_users.token"
+              exit 1
+              ;;
+            403)
+              echo "::error::HTTP 403 — токен валиден, но пользователь не админ (isAdminUser=false)"
+              exit 1
+              ;;
+            404)
+              echo "::error::HTTP 404 — неверный WORKER_URL. Проверь, что /api/admin/sync существует."
+              exit 1
+              ;;
+            500)
+              echo "::error::HTTP 500 — воркер упал внутри syncPool (часто: GH_PATH указывает на несуществующий файл)"
+              exit 1
+              ;;
+            *)
+              echo "::error::Неожиданный HTTP $CODE"
+              exit 1
+              ;;
+          esac
